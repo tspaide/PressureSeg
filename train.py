@@ -42,6 +42,8 @@ models = {
 }
 
 videolist = ['58', '61', '62', '65', '66', '69', '71']
+corners = 'shuffle'
+num_classes = 3
 
 class Diceloss():
     '''
@@ -78,7 +80,21 @@ class Diceloss():
 
 def bisum(x):
     return torch.sum(torch.sum(x,1),1)
-        
+
+def makenames(models_path, validations_path, name_suffix)
+    if models_path is None and name_suffix is None:
+        raise ValueError('Please supply a models-path or name-suffix value')
+    if name_suffix is not None:
+        if backend == 'squeezenet':
+            type = 'squeeze'
+        else:
+            type = backend[6:]
+        if models_path is None:
+            models_path='_'.join(['snaps',validate_on,type]) + name_suffix
+        if validation_path is None:
+            validation_path='_'.join(['../validations',validate_on,type]) + name_suffix
+    return models_path, validation_path
+    
 def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1):
     epoch = 0
     backend = backend.lower()
@@ -146,11 +162,27 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
     val_losses = []
     if(validation_path != None):
         os.makedirs(validation_path, exist_ok=True)
-    for name, x, y, y_cls in val_iterator:
+    for name, x, y, y_cls, *a in val_iterator:
+        if corners=='together':
+            x, y = torch.cat(*x, 0), torch.cat(*y, 0)
+            y_cls = torch.max(torch.stack(*y_cls), 0)[0]
+        if(validation_path is not None):
+            im = x[0].numpy().transpose(1,2,0)
         x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
         out, out_cls = net(x)
+        mults = torch.ones_like(y_cls)
+        if corners == 'shuffle':
+            mults = (1-a[0]).cuda()
+            if class_weights is not None:
+                corr = torch.mean(torch.log(2-mults)*class_weights)
+            else:
+                corr = torch.mean(torch.log(2-mults))
+        if corners == 'together':
+            out_cls = torch.max(out_cls.view(-1, 4, num_classes), 1)[0]
         #seg_loss, cls_loss = seg_criterion(out, y, inprobs=torch.sigmoid(out_cls[:,2])), cls_criterion(out_cls, y_cls)
-        seg_loss, cls_loss = seg_criterion(out, y, inpres=y_cls[:,2]), cls_criterion(out_cls, y_cls)
+        seg_loss, cls_loss = seg_criterion(out, y, inpres=y_cls[:,2]), cls_criterion(out_cls*mults, y_cls*mults)
+        if corners == 'shuffle':
+            cls_loss = cls_loss-corr
         loss = seg_loss + alpha * cls_loss
         val_losses.append(loss.data.item())
         if(validation_path == None):
@@ -160,12 +192,12 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
             status = '[{0}Output-Val] loss = {1:0.5f} avg = {2:0.5f}'.format(
                 epoch + 1, loss.data.item(), np.mean(val_losses))
         val_iterator.set_description(status)
-        if(validation_path != None):
+        if(validation_path is not None):
             fig, (ax1, ax2, ax3) = plt.subplots(nrows=1, ncols=3, figsize=(9,3))
-            imarr = io.imread(os.path.join('../joanne/joanne_seg_manual/', name[0] +'.png'))
-            transim = skimage.transform.rescale(imarr[:,320:1600], 0.2)
+            #imarr = io.imread(os.path.join('../joanne/joanne_seg_manual/', name[0] +'.png'))
+            #transim = skimage.transform.rescale(imarr[:,320:1600], 0.2)
             ax1.set_title(name[0])
-            ax1.imshow(transim)
+            ax1.imshow(im)
             out = torch.exp(out)
             inprob = torch.sigmoid(out_cls[0,2])
             out[:,1] += out[:,2]*(1-inprob)
@@ -178,7 +210,11 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
             ax3.set_title(' '.join([name[0], 'truth']))
             ax3.imshow(y[0], cmap='Set1', norm = NoNorm())
             fig.text(0.5, 0.05, f'Loss={loss}', horizontalalignment='center', verticalalignment='bottom')
-            fig.savefig(os.path.join(validation_path, '.'.join([name[0],'png'])))
+            if corners=='shuffle':
+                outname = '_'.join([name[0], str(a[1].item())])
+            else:
+                outname = name[0]
+            fig.savefig(os.path.join(validation_path, '.'.join([outname,'png'])))
             plt.close(fig)
             results.append((name[0], loss.item()))
     if(validation_path != None):
@@ -189,10 +225,10 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
         print(f'Validation loss: {val_loss}')
     return np.mean(val_losses)
 
-'''
+
 @click.command()
 @click.option('--data-path', type=str, default="", help='Path to dataset folder')
-@click.option('--models-path', type=str, help='Path for storing model snapshots')
+@click.option('--models-path', type=str, default=None, help='Path for storing model snapshots')
 @click.option('--backend', type=str, default='resnet34', help='Feature extractor')
 @click.option('--snapshot', type=str, default=None, help='Path to pretrained weights')
 @click.option('--crop_x', type=int, default=256, help='Horizontal random crop size')
@@ -208,10 +244,11 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
 @click.option('--shuffle', type=bool, default=True, help='Shuffle dataset before splitting')
 @click.option('--validate-freq', type=int, default=1, help='Validation frequency')
 @click.option('--validate-on', type=str, default=None, help='Validate on a particular subject, e.g. \'51\' or \'46OS\'; overrides other split modifiers')
-'''
+@click.option('--name-suffix', type=str, default=None, help='Autogen path names with the given suffix')
 def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
           alpha, epochs, start_lr, milestones, gpu, train_prop, validation_path,
-          shuffle, validate_freq, validate_on):
+          shuffle, validate_freq, validate_on, name_suffix):
+    models_path, validations_path = makenames(models_path, validations_path, name_suffix)
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     models_path = os.path.abspath(os.path.expanduser(models_path))
     validation_path = os.path.abspath(os.path.expanduser(validation_path))
@@ -222,7 +259,7 @@ def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
         (Bx3xHxW FloatTensor x, BxHxW LongTensor y, BxN FloatTensor y_cls) where (EDIT: y_cls needs to be a FloatTensor rather than a LongTensor)
         x - batch of input images,
         y - batch of groung truth seg maps,
-        y_cls - batch of 1D tensors of dimensionality N: N total number of classes, 
+        y_cls - batch of 1D tensors of dimensionality N: N total number of classes,
         y_cls[i, T] = 1 if class T is present in image i, 0 otherwise
     '''
     train_loader, class_weights, n_images = None, None, None
@@ -236,10 +273,12 @@ def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
     if snapshot is None:
         (train_dat, val_dat) = getdata.splitset("../joanne/joanne_seg_manual/", "../joanne/true_avg_circles.json",
                                                 train_prop, shuffle = shuffle, validate_on = validate_on, tame = 'yes',
-                                                fill = True)
+                                                corners = corners)
     else:
         f = open('_'.join([snapshot, 'set']), 'rb')
         (train_dat, val_dat) = pickle.load(f)
+        train_dat.updateparams()
+        val_dat.updateparams()
         f.close()
     train_loader = DataLoader(train_dat, shuffle=True, batch_size = batch_size)
     
@@ -254,12 +293,26 @@ def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
         train_iterator = tqdm(train_loader)
         scheduler.step()
         net.train()
-        for name, x, y, y_cls in train_iterator:
+        for name, x, y, y_cls, *a in train_iterator:
             optimizer.zero_grad()
+            if corners=='together':
+                x, y = torch.cat(*x, 0), torch.cat(*y, 0)
+                y_cls = torch.max(torch.stack(*y_cls), 0)[0]
             x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
             out, out_cls = net(x)
+            mults = torch.ones_like(y_cls)
+            if corners == 'shuffle':
+                mults = (1-a[0]).cuda()
+                if class_weights is not None:
+                    corr = torch.mean(torch.log(2-mults)*class_weights)
+                else:
+                    corr = torch.mean(torch.log(2-mults))
+            if corners == 'together':
+                out_cls = torch.max(out_cls.view(-1, 4, num_classes), 1)[0]
             #seg_loss, cls_loss = seg_criterion(out, y, inprobs=torch.sigmoid(out_cls[:,2])), cls_criterion(out_cls, y_cls)
-            seg_loss, cls_loss = seg_criterion(out, y, inpres=y_cls[:,2]), cls_criterion(out_cls, y_cls)
+            seg_loss, cls_loss = seg_criterion(out, y, inpres=y_cls[:,2]), cls_criterion(out_cls*mults, y_cls*mults)
+            if corners == 'shuffle':
+                cls_loss = cls_loss - corr
             loss = seg_loss + alpha * cls_loss
             epoch_losses.append(loss.data.item())
             status = '[{0}] loss = {1:0.5f} avg = {2:0.5f}, LR = {3:0.7f}'.format(
@@ -284,9 +337,9 @@ def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
     return {'train':train_losses, 'validate':val_losses}
 
 if __name__ == '__main__':
-    #train()
-    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-    net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50sdz/PSPNet_22', 'resnet50', 0.001, '10,20,30')
-    for x in videolist:
-        for y in ['OD','OS']:
-            movwrite(net, '_'.join([x,y]), '../../yue/joanne/video_frames_test/', '_'.join(['segs',x,y])+'.avi')
+    train()
+    #os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+    #net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50sdz/PSPNet_22', 'resnet50', 0.001, '10,20,30')
+    #for x in videolist:
+    #    for y in ['OD','OS']:
+    #        movwrite(net, '_'.join([x,y]), '../../yue/joanne/video_frames_test/', '_'.join(['segs',x,y])+'.avi')

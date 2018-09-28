@@ -25,28 +25,45 @@ import pickle
 import logging
 import warnings
 import math
+import json
 
 import sys
 sys.path.insert(0, "../pressure-seg")
 import getdata
 
 models = {
-    'squeezenet': lambda: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet'),
-    'densenet': lambda: PSPCircs(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet'),
-    'resnet18': lambda: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18'),
-    'resnet34': lambda: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34'),
-    'resnet50': lambda: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50'),
-    'resnet101': lambda: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101'),
-    'resnet152': lambda: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152')
+    'squeezenet': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet', w=w, h=h, extraend=extra),
+    'densenet': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet', w=w, h=h, extraend=extra),
+    'resnet18': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18', w=w, h=h, extraend=extra),
+    'resnet34': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34', w=w, h=h, extraend=extra),
+    'resnet50': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50', w=w, h=h, extraend=extra),
+    'resnet101': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101', w=w, h=h, extraend=extra),
+    'resnet152': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152', w=w, h=h, extraend=extra)
 }
                 
 videolist = ['58', '61', '62', '65', '66', '69', '71']
-#videolist = ['58', '62', '65', '69', '71']
     
-def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1):
+def makenames(models_path, validations_path, name_suffix)
+    if models_path is None and name_suffix is None:
+        raise ValueError('Please supply a models-path or name-suffix value')
+    if name_suffix is not None:
+        if backend == 'squeezenet':
+            type = 'squeeze'
+        else:
+            type = backend[6:]
+        if models_path is None:
+            models_path='_'.join(['snaps',validate_on,type]) + name_suffix
+        if validation_path is None:
+            validation_path='_'.join(['../validations',validate_on,type]) + name_suffix
+    return models_path, validation_path
+    
+def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1, oldmode = False):
     epoch = 0
     backend = backend.lower()
-    net = models[backend]()
+    if oldmode:
+        net = models[backend](27, 32, False)
+    else:
+        net = models[backend](54, 64, False)
     net = nn.DataParallel(net)
     optimizer = optim.Adam(net.parameters(), lr=start_lr)
     milestones=[int(x) for x in milestones.split(',')]
@@ -58,6 +75,7 @@ def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1):
             optimizer.load_state_dict(old['optimizer'])
             scheduler = MultiStepLR(optimizer, milestones = milestones, gamma = gamma, last_epoch = epoch-1)
         except KeyError:
+            net = models[backend](27, 32, False)
             _, epoch = os.path.basename(snapshot).split('_')
             epoch = int(epoch)
             net.load_state_dict(load(snapshot))
@@ -65,6 +83,7 @@ def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1):
         logging.info("Snapshot for epoch {} loaded from {}".format(epoch, snapshot))
     else:
         scheduler = MultiStepLR(optimizer, milestones = milestones, gamma = gamma)
+        #scheduler = ExponentialLR(optimizer, 0.8)
     net = net.cuda()
     return net, optimizer, epoch, scheduler
 
@@ -72,14 +91,16 @@ def movwrite(net, val_on, data_path, save_path):
     set1 = [[28,26,228], [184, 126, 55], [74,175,77]]
     dat = getdata.Im_Dataset(data_path, val_on)
     if(len(dat)==0):
-        return
+        return None
     dat_loader = DataLoader(dat)
     dat_iterator = tqdm(dat_loader)
     dat_iterator.set_description(save_path)
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    vid = cv2.VideoWriter('.'.join([save_path,'avi']), fourcc, 25, (808, 256))
+    #fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    #vid = cv2.VideoWriter('.'.join([save_path,'avi']), fourcc, 25, (808, 256))
     pressures = []
+    results = []
     net.eval()
+    torch.set_grad_enabled(False)
     for name, x in dat_iterator:
         xv = Variable(x).cuda()
         out, out_cls = net(xv)
@@ -88,6 +109,7 @@ def movwrite(net, val_on, data_path, save_path):
         im_arr = (x[0]*256).numpy().astype('uint8')
         im_arr = np.flip(im_arr,0).transpose(1,2,0)
         lr = outc[2]
+        '''
         if(out_cls[0,2]>0.5):
             out_arr = np.array(getdata.circfill(outc[:3], outc[3:], width=256, height=216, style=set1, classes=False)).astype('uint8')
             circover = np.array(getdata.circdraw(outc[:3], outc[3:], width=256, height=216, thickness=1, style=[[0,0,0],[255,255,255]], classes=False)).astype('uint8')
@@ -95,21 +117,30 @@ def movwrite(net, val_on, data_path, save_path):
         else:
             out_arr = np.array(getdata.circfill(outc[:3], [0,0,0], width=256, height=216, style=set1, classes=False)).astype('uint8')
             circover = np.array(getdata.circdraw(outc[:3], [0,0,0], width=256, height=216, thickness=1, style=[[0,0,0],[255,255,255]], classes=False)).astype('uint8')
-            ir = 0
+            ir = torch.tensor(0)
         frame = np.full((256, 808, 3), 255, np.dtype('uint8'))
         frame[10:226, 10:266] = im_arr
         frame[10:226, 276:532] = out_arr
         frame[10:226, 542:798] = cv2.max(im_arr, circover)
         cv2.putText(frame, f'{name[0]}', (246, 248), 0, 0.8, (0,0,0))
         vid.write(frame)
-        pressures.append(getdata.calc_iop_from_circles(lr,ir))
-    fig, ax = plt.subplots()
-    ax.plot(pressures)
-    ax.set_xlabel('Frame')
-    ax.set_ylabel('Pressure')
-    fig.savefig('.'.join([save_path,'png']))
-    vid.release()
-    cv2.destroyAllWindows()
+        '''
+        if(out_cls[0,2]>0.5):
+            ir = outc[5]
+        else:
+            ir = torch.tensor(0)
+        pressures.append(getdata.calc_iop_from_circles(lr.item(),ir.item()))
+        results.append(outc.numpy())
+    torch.set_grad_enabled(True)
+    #fig, ax = plt.subplots()
+    #ax.plot(pressures)
+    #ax.set_xlabel('Frame')
+    #ax.set_ylabel('Pressure (mm Hg)')
+    #ax.set_ylim(0,30)
+    #fig.savefig('.'.join([save_path,'png']))
+    #vid.release()
+    #cv2.destroyAllWindows()
+    return pressures, results
     
 def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights = None):
     net.eval()
@@ -142,14 +173,14 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
         if(validation_path != None):
             fig, (ax1, ax2, ax3) = plt.subplots(nrows=1, ncols=3, figsize=(9,3))
             imarr = io.imread(os.path.join('../joanne/joanne_seg_manual/', name[0] +'.png'))
-            transim = skimage.transform.rescale(imarr[:,320:1600], 0.2)
+            transim = skimage.transform.rescale(imarr[:,320:1600], 0.4)
             ax1.set_title(name[0])
             ax1.imshow(transim)
             if(out_clsc[2]<.1):
-                outs = getdata.circfill(outc[:3], [0,0,0], 256, 216)[0]
+                outs = getdata.circfill(outc[:3], [0,0,0], 512, 432)[0]
             else:
-                outs = getdata.circfill(outc[:3], outc[3:], 256, 216)[0]
-            trues = getdata.circfill(yc[:3], yc[3:], 256, 216)[0]
+                outs = getdata.circfill(outc[:3], outc[3:], 512, 432)[0]
+            trues = getdata.circfill(yc[:3], yc[3:], 512, 432)[0]
             ax2.set_title(' '.join([name[0], 'output']))
             ax2.imshow(outs, cmap='Set1', norm = NoNorm())
             #temp = torch.zeros_like(out[0])
@@ -188,9 +219,11 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
 @click.option('--shuffle', type=bool, default=True, help='Shuffle dataset before splitting')
 @click.option('--validate-freq', type=int, default=1, help='Validation frequency')
 @click.option('--validate-on', type=str, default=None, help='Validate on a particular subject, e.g. \'51\' or \'46OS\'; overrides other split modifiers')
+@click.option('--name-suffix', type=str, default=None, help='Autogen path names with the given suffix')
 def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
           alpha, epochs, start_lr, milestones, gpu, train_prop, validation_path,
-          shuffle, validate_freq, validate_on):
+          shuffle, validate_freq, validate_on, name_suffix):
+    models_path, validations_path = makenames(models_path, validations_path, name_suffix)
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     models_path = os.path.abspath(os.path.expanduser(models_path))
     #validation_path = os.path.abspath(os.path.expanduser(validation_path))
@@ -225,6 +258,7 @@ def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size
     train_losses = []
     val_losses = []
     
+    
     for epoch in range(starting_epoch, starting_epoch + epochs):
         seg_criterion = getdata.Circles_Dice()
         cls_criterion = nn.BCEWithLogitsLoss(weight=class_weights)
@@ -237,10 +271,9 @@ def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size
             optimizer.zero_grad()
             x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
             out, out_cls = net(x)
-            indices = torch.tensor([1,1,1,2,2,2]).cuda()
-            mults = torch.index_select(y_cls, 1, indices)
+            #indices = torch.tensor([1,1,1,2,2,2]).cuda()
+            #mults = torch.index_select(y_cls, 1, indices)
             #seg_loss, cls_loss = seg_criterion(out*mults, y*mults), cls_criterion(out_cls, y_cls)
-            
             seg_loss, cls_loss = seg_criterion(out, y), cls_criterion(out_cls, y_cls)
             loss = seg_loss + alpha * cls_loss
             
@@ -248,7 +281,6 @@ def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size
             status = '[{0}] loss = {1:0.5f} avg = {2:0.5f}, LR = {3:0.7f}'.format(
                 epoch + 1, loss.data.item(), np.mean(epoch_losses), scheduler.get_lr()[0])
             train_iterator.set_description(status)
-            loss = loss + .002*reg(torch.abs(out*mults), torch.abs(y*mults))
             loss.backward()
             optimizer.step()
         
@@ -269,10 +301,40 @@ def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size
     return {'train':train_losses, 'validate':val_losses}
     
 if __name__ == '__main__':
-    #ctrain()
+
+    ctrain()
+    '''
     os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-    #net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50nump/PSPNet_30', 'resnet50', 0.001, '10,20,30')
+    net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50nump/PSPNet_30', 'resnet50', 0.001, '10,20,30')
     net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50num/PSPNet_17', 'resnet50', 0.001, '10,20,30')
+    ans = {}
+    resultsdict = {}
     for x in videolist:
         for y in ['OD', 'OS']:
-            movwrite(net, '_'.join([x,y]), '../../yue/joanne/video_frames_test/', '_'.join(['circs',x,y]))
+            ps = movwrite(net, '_'.join([x,y]), '../../yue/joanne/video_frames_test/', '_'.join(['circs',x,y]))
+            if ps is not None:
+                pressures, results = ps
+                ans['_'.join([x,y])] = pressures
+                resultsdict['_'.join([x,y])] = results
+    #f = open('pressures.json', 'w')
+    #json.dump(ans, f)
+    #f.close()
+    f = open('results.json', 'w')
+    json.dump(resultsdict, f)
+    f.close()
+    '''
+    
+    '''
+    f = open('pressures.json')
+    fpress = json.load(f)
+    for (k,v) in fpress.items():
+        fig, ax = plt.subplots()
+        ax.plot(v)
+        ax.set_xlabel('Frame')
+        ax.set_ylabel('Pressure (mm Hg)')
+        ax.set_ylim(0,30)
+        ax.minorticks_on()
+        ax.grid(True)
+        ax.grid(True, 'minor', 'y', color='#CCCCCC', linewidth=0.5)
+        fig.savefig('_'.join(['circs',k])+'.png')
+    '''
