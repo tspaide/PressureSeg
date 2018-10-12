@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import torchvision.transforms.functional as F
+import circareas
 
 import cv2
 import time
@@ -102,7 +103,7 @@ def overlap(circa, circb, missloss = False):
     return ( r2 * alpha + R2 * beta - 0.5 * (r2 * torch.sin(2*alpha) + R2 * torch.sin(2*beta)) ), False
     
 def dice_circle_loss(circa, circb, epsilon=0.001, size_average=True, reduce = True, negate = True,
-                     missloss = True, addloss = None):
+                     missloss = True, addloss = None, cropbox = None):
     '''
         Smoothed dice for data of two (batches of) circles
         Circles should be (B,3) tensors of the form [[x1,y1,r1],[x2,y2,r2],...]
@@ -115,16 +116,25 @@ def dice_circle_loss(circa, circb, epsilon=0.001, size_average=True, reduce = Tr
         if(circb[n,2]==0):
             dices[n]=1
         else:
-            over, cont = overlap(circa[n], circb[n], missloss)
-            dices[n]=(2*over+epsilon)/(np.pi*(circa[n,2]**2+circb[n,2]**2)+epsilon)
+            if cropbox is None:
+                over, cont = overlap(circa[n], circb[n], missloss)
+                area = np.pi*(circa[n,2]**2+circb[n,2]**2)
+            else:
+                cropbox = torch.tensor(cropbox, dtype=torch.float, device=circa.device)
+                xa, ya, ra = circa[n,0], circa[n,1], torch.abs(circa[n,2])
+                xb, yb, rb = circb[n,0], circb[n,1], torch.abs(circb[n,2])
+                over = circareas.cropcircoverlap(xa,ya,ra,xb,yb,rb, *cropbox)
+                if(over==0 and missloss):
+                    d = ((xa-xb)**2 + (ya-yb)**2)**0.5
+                    over = ra + rb - d
+                areaa = circareas.cropcircarea(xa,ya,ra, *cropbox)
+                areab = circareas.cropcircarea(xb,yb,rb, *cropbox)
+                area = areaa+areab
+                if((areaa==circareas.boxarea(*cropbox) or areab==circareas.boxarea(*cropbox)) and missloss):
+                    over = over-torch.abs(ra-rb)
+            dices[n]=(2*over+epsilon)/(area+epsilon)
             if addloss is not None:
                 dices[n] += addloss[n]
-            
-    #rs = circa[:,2]
-    #r2s = torch.pow(rs, 2)
-    #Rs = circb[:,2]
-    #R2s = torch.pow(Rs, 2)
-    #dices = (2*overlaps+epsilon)/(math.pi*(r2s+R2s)+epsilon)
     if(negate):
         dices = 1-dices
     if(reduce):
@@ -141,18 +151,19 @@ class Circles_Dice():
         Note that lens dice is actually (lens+inner) dice
         Also calculation of inner stuff is wrong in situations where inner circle is cut off by the edge of lens
     '''
-    def __init__(self, epsilon=0.001, size_average=True, reduce = True, missloss = True):
+    def __init__(self, epsilon=0.001, size_average=True, reduce = True, missloss = True, cropbox=None):
         self.epsilon = epsilon
         self.size_average = size_average
         self.reduce = reduce
         self.missloss = missloss
+        self.cropbox = cropbox
     def __call__(self, out, y, inprob=1, lsmall = None, insmall = None):
         outlens, outin = out.split([3,3],1)
         ylens, yin = y.split([3,3],1)
         lensdice = dice_circle_loss(outlens, ylens, epsilon=self.epsilon, size_average=self.size_average,
-                                    reduce=self.reduce, missloss=self.missloss, addloss = lsmall)
+                                    reduce=self.reduce, missloss=self.missloss, addloss = lsmall, cropbox=self.cropbox)
         indice = dice_circle_loss(outin, yin, epsilon=self.epsilon, size_average=self.size_average,
-                                  reduce=self.reduce, missloss=self.missloss, addloss = insmall)
+                                  reduce=self.reduce, missloss=self.missloss, addloss = insmall, cropbox=self.cropbox)
         return lensdice+indice
 
 def algproc(y):
@@ -338,6 +349,10 @@ class Mapper():
     def __call__(self, input):
         return map(self.op, input)
 
+class Unzipper():
+    def __call__(self, input):
+        return zip(*input)
+        
 class RandomResizedCropP():
     '''
         If tame='yes' it will try to make sure the eye is completely in frame
@@ -374,6 +389,13 @@ class RandomResizedCropP():
         else:
             miny = max(0, ly-cropheight)
             maxy = min(height-cropheight, ly) + 1
+        if(minx>maxx) or (miny>maxy):
+            print(minx, maxx)
+            print(miny, maxy)
+            print(lens_data)
+            print(inner_data)
+            print(width, height)
+            print(scale, cropwidth, cropheight)
         x = np.random.randint(minx, maxx)
         y = np.random.randint(miny, maxy)
         lx, ly, lr = scale*(lx-x),scale*(ly-y),scale*lr
@@ -453,11 +475,14 @@ class PadP():
         if lens_data is None:
             image, lens_data, inner_data = image
         (lx, ly, lr) = lens_data
+        lens_data = (lx+self.x,ly+self.y,lr)
         (ix, iy, ir) = inner_data
+        if(ir>0):
+            inner_data=(ix+self.x,iy+self.y,ir)
         im_arr = np.asarray(image)
         im_arr = np.pad(im_arr, ((self.y, self.y), (self.x, self.x), (0,0)), 'edge')
         image = PIL.Image.fromarray(im_arr)
-        return image, (lx+self.x,ly+self.y,lr), (ix+self.x,iy+self.y,ir)
+        return image, lens_data, inner_data
         
 def rotateP(image, lens_data = None, inner_data = None, angle=0, resizing=False):
     if lens_data is None:
@@ -494,30 +519,30 @@ def rotateP(image, lens_data = None, inner_data = None, angle=0, resizing=False)
     image = F.crop(padim, pt-toppad, pl-leftpad, h+toppad+botpad, w+leftpad+rightpad)
     return image, (lx, ly, lr), (ix, iy, ir)
 
-class fourCuts():
+class FourCuts():
     def __init__(self, xrange=0, yrange=0):
         self.xrange=xrange
         self.yrange=yrange
-    def __call__(self, im_arr, lens_data=None, inner_data=None):
+    def __call__(self, image, lens_data=None, inner_data=None):
         if lens_data is None:
-            im_arr, lens_data, inner_data = im_arr
-        (h,w) = im_arr.shape[:2]
-        x = int(w/2 - self.xrange + 2*xrange*np.random.random_sample())
-        y = int(h/2 - self.yrange + 2*yrange*np.random.random_sample())
-        corners = [getquarter(im_arr, n, lens_data, inner_data, x, y) for n in range(4)]
-        return corners
+            image, lens_data, inner_data = image
+        (w,h) = image.size
+        x = int(w/2 - self.xrange + 2*self.xrange*np.random.random_sample())
+        y = int(h/2 - self.yrange + 2*self.yrange*np.random.random_sample())
+        corners = [getquarter(np.asarray(image), n, lens_data, inner_data, x, y) for n in range(4)]
+        return [(PIL.Image.fromarray(im), l, i) for (im, l, i) in corners]
 
-forkHuts = fourCuts
+ForkHuts = FourCuts
 
 class CornerResize():
-    def __init__(self, width, height, scale, maxscale=None, tame = 'yes'):
+    def __init__(self, width, height, scale, maxscale=None, checkonly=False):
         self.finwidth = width
         self.finheight = height
         self.minscale = scale
         if maxscale is None:
             maxscale = scale
         self.maxscale = maxscale
-        self.tame = tame
+        self.checkonly = checkonly
     def __call__(self, image, lens_data = None, inner_data = None):
         # Code for ignores[1] may leak some edge cases (ha);
         # I'll fix this if it actually comes up
@@ -549,6 +574,8 @@ class CornerResize():
                 maxix = w
             if maxix>=w:
                 ignores[2]=1
+        if('checkonly' in vars(self) and self.checkonly):
+            return image, lens_data, inner_data, ignores
         minh = h-maxy
         minw = w-maxx
         maxscale = min(self.maxscale, self.finwidth/minw, self.finheight/minh)
@@ -753,7 +780,7 @@ class Pad():
         return np.pad(image, ((self.y, self.y), (self.x, self.x), (0,0)), 'edge'), (lx+self.x,ly+self.y,lr), (ix+self.x,iy+self.y,ir)
    
 def splitset(img_dir, circle_file, train_prop = 0.8, shuffle = False, seed = None, validate_on = None,
-             tame = 'yes', fill = True, coords = False, dual = False, corners = False):
+             tame = 'yes', fill = True, coords = False, dual = False, corners = None):
     annotations = getannotations(circle_file)
     if(shuffle):
         np.random.seed(seed)
@@ -778,25 +805,30 @@ def splitset(img_dir, circle_file, train_prop = 0.8, shuffle = False, seed = Non
         train_len = int(train_prop*len(annotations))
         trainset = annotations[:train_len]
         valset = annotations[train_len:]
-    if corners:
+    if corners=='shuffle':
         train_trans = transforms.Compose([ToPil(), CornerResize(256, 216, 0.3, 0.5), ToTens()])
         val_trans = transforms.Compose([ToPil(), CornerResize(256, 216, 0.4), ToTens()])
+    elif corners=='together':
+        scalings = [transforms.Compose([PadP(320, 270), RandomResizedCropP(512, 432, 0.267, 0.4)]),
+                    RandomResizedCropP(512, 432, 0.4)]
+        train_trans = transforms.Compose([ToPil(), RandRotateP(45, resizing=True), transforms.RandomChoice(scalings), FourCuts(), Mapper(CornerResize(256,216,1,checkonly=True)), Mapper(ToTens()), Unzipper()])
+        val_trans = transforms.Compose([ToPil(), CropP(320,0,1600,1080), ResizeP(432), FourCuts(), Mapper(CornerResize(256,216,1,checkonly=True)), Mapper(ToTens()), Unzipper()])
     elif tame=='yes':
         #train_trans = transforms.Compose([transforms.RandomApply([Pad(320, 270), RandRescale(0.67,1.)]), RandRotate(15, resizing=True), RandomCrop(1280, 1080), Rescale(0.2), RandHorizFlip()])
         #val_trans = transforms.Compose([Crop(320,0,1600,1080), Rescale(0.2)])
-        scalings = [transforms.Compose([PadP(320, 270), RandomResizedCropP(512, 432, 0.267, 0.4)]),
-                    RandomResizedCropP(512, 432, 0.4)]
+        scalings = [transforms.Compose([PadP(320, 270), RandomResizedCropP(256, 216, 0.134, 0.2)]),
+                    RandomResizedCropP(256, 216, 0.2)]
         train_trans = transforms.Compose([ToPil(), RandRotateP(15, resizing=True),
                                           transforms.RandomChoice(scalings), ToTens()])
                                           #transforms.RandomChoice(scalings), transforms.RandomApply([FlipP()]), ToTens()])
-        val_trans = transforms.Compose([ToPil(), CropP(320,0,1600,1080), ResizeP(432), ToTens()])
+        val_trans = transforms.Compose([ToPil(), CropP(320,0,1600,1080), ResizeP(216), ToTens()])
     else:
         train_trans = transforms.Compose([RandRescale(.25,.3), RandRotate(15), RandomCrop(256, 256, tame)])
         val_trans = transforms.Compose([Crop(448,28,1472,1052), Rescale(0.25)])
     
     if coords:
-        train_dat = Coord_Dataset(img_dir, annotations = trainset, transform = train_trans)
-        val_dat = Coord_Dataset(img_dir, annotations = valset, transform = val_trans)
+        train_dat = Coord_Dataset(img_dir, annotations = trainset, transform = train_trans, corners=corners)
+        val_dat = Coord_Dataset(img_dir, annotations = valset, transform = val_trans, corners=corners)
     elif dual:
         train_dat = Dual_Dataset(img_dir, annotations = trainset, transform = train_trans)
         val_dat = Dual_Dataset(img_dir, annotations = valset, transform = val_trans)
@@ -838,7 +870,6 @@ class Inner_Dataset(Dataset): # Only has inner data
         
 class Im_Dataset(Dataset): # Images only; no checking
     def __init__(self, img_dir, check_on, transform = None):
-        self.check_on = check_on
         self.img_dir = img_dir
         self.filelist = [x for x in os.listdir(img_dir) if ('iP0'+check_on) in x]
         self.filelist.sort(key=lambda x:int(x[14:-4]))
@@ -922,7 +953,7 @@ class Circ_Dataset(Dataset):
             self.corners = 'shuffle'
         
 class Coord_Dataset(Dataset):
-    def __init__(self, img_dir, circle_file = None, annotations = None, transform = None):
+    def __init__(self, img_dir, circle_file = None, annotations = None, transform = None, corners = None):
         if(circle_file != None):
             self.annotations = getannotations(circle_file)
         elif(annotations != None):
@@ -931,29 +962,54 @@ class Coord_Dataset(Dataset):
             raise ValueError('Coord_Dataset needs a circle_file or annotations argument')
         self.img_dir = img_dir
         self.transform = transform
+        self.corners = corners
         
     def __len__(self):
-        return len(self.annotations)
+        if self.corners=='shuffle':
+            return 4*len(self.annotations)
+        else:
+            return len(self.annotations)
 
     def __getitem__(self, idx):
-        
+        if self.corners == 'shuffle':
+            quadrant = idx % 4
+            idx = idx // 4
         k,v = self.annotations[idx]
         img_name = os.path.join(self.img_dir, k + ".png")
-        im_array = io.imread(img_name)
+        im_arr = io.imread(img_name)
         lens_data = v['lens_data']
         inner_data = v['inner_data']
+        if self.corners == 'shuffle':
+            im_arr, lens_data, inner_data = getquarter(im_arr, quadrant, lens_data, inner_data)
         if self.transform is not None:
-            image, lens_data, inner_data = self.transform((im_array, lens_data, inner_data))
+            image, lens_data, inner_data, *a = self.transform((im_arr, lens_data, inner_data))
         else:
-            image = torch.tensor(im_array.transpose(2,0,1), dtype=torch.float)
+            image = im_arr
+            a = []
+        out, out_cls = self._gettruth(lens_data, inner_data)
+        if self.corners == 'shuffle':
+            a.append(quadrant)
+        if self.corners == 'together':
+            image, out, out_cls = torch.stack(image, 0), torch.stack(out, 0), torch.stack(out_cls, 0)
+            a = [torch.stack(a[0],0)]
+        if isinstance(image, np.ndarray):
+            image = torch.tensor(image.transpose(2,0,1), dtype=torch.float)
+        return (k, image, out, out_cls, *a)
+        
+    def _gettruth(self, lens_data, inner_data):
+        if isinstance(lens_data[0], tuple):
+            return zip(*[self._gettruth(l, i) for (l, i) in zip(lens_data, inner_data)])
         out = torch.tensor(lens_data + inner_data)
         out_cls = torch.zeros(3, dtype=torch.float)
         out_cls[0]=1
         out_cls[1]=1
         if (inner_data[2]>0):
             out_cls[2]=1
-        #print(image.shape, out.shape)
-        return k, image, out, out_cls
+        return out, out_cls
+        
+    def updateparams(self):
+        if not 'corners' in vars(self):
+            self.corners = None
 
 class Dual_Dataset(Dataset):
     def __init__(self, img_dir, circle_file = None, annotations = None, transform = None):
@@ -984,6 +1040,7 @@ class Dual_Dataset(Dataset):
         outim = torch.tensor(outarr, dtype=torch.long)
         outdat = torch.tensor(lens_data + inner_data)
         return k, image, outim, outdat, out_cls
+
   
 '''  
 fourcc = cv2.VideoWriter_fourcc(*'XVID')

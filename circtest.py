@@ -17,6 +17,7 @@ from matplotlib.colors import NoNorm
 from skimage import io
 import skimage
 import cv2
+from PIL import Image
 
 import pspnet
 from pspnet import PSPNet, PSPCircs
@@ -32,18 +33,19 @@ sys.path.insert(0, "../pressure-seg")
 import getdata
 
 models = {
-    'squeezenet': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet', w=w, h=h, extraend=extra),
-    'densenet': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet', w=w, h=h, extraend=extra),
-    'resnet18': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18', w=w, h=h, extraend=extra),
-    'resnet34': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34', w=w, h=h, extraend=extra),
-    'resnet50': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50', w=w, h=h, extraend=extra),
-    'resnet101': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101', w=w, h=h, extraend=extra),
-    'resnet152': lambda h, w, extra: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152', w=w, h=h, extraend=extra)
+    'squeezenet': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet', w=w, h=h, combinecorners=(corners=='together')),
+    'densenet': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet', w=w, h=h, combinecorners=(corners=='together')),
+    'resnet18': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18', w=w, h=h, combinecorners=(corners=='together')),
+    'resnet34': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34', w=w, h=h, combinecorners=(corners=='together')),
+    'resnet50': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50', w=w, h=h, combinecorners=(corners=='together')),
+    'resnet101': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101', w=w, h=h, combinecorners=(corners=='together')),
+    'resnet152': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152', w=w, h=h, combinecorners=(corners=='together'))
 }
                 
 videolist = ['58', '61', '62', '65', '66', '69', '71']
+num_classes = 3
     
-def makenames(models_path, validations_path, name_suffix)
+def makenames(models_path, validation_path, snapshot, validate_on, backend, name_suffix, prev_epoch):
     if models_path is None and name_suffix is None:
         raise ValueError('Please supply a models-path or name-suffix value')
     if name_suffix is not None:
@@ -54,16 +56,15 @@ def makenames(models_path, validations_path, name_suffix)
         if models_path is None:
             models_path='_'.join(['snaps',validate_on,type]) + name_suffix
         if validation_path is None:
-            validation_path='_'.join(['../validations',validate_on,type]) + name_suffix
-    return models_path, validation_path
+            validation_path='_'.join(['../joanne/validations',validate_on,type]) + name_suffix
+    if prev_epoch is not None and snapshot is None:
+        snapshot = os.path.join(models_path, '_'.join(['PSPNet', str(prev_epoch)]))
+    return models_path, validation_path, snapshot
     
-def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1, oldmode = False):
+def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1, oldmode = False, corners=None):
     epoch = 0
     backend = backend.lower()
-    if oldmode:
-        net = models[backend](27, 32, False)
-    else:
-        net = models[backend](54, 64, False)
+    net = models[backend](27, 32, corners)
     net = nn.DataParallel(net)
     optimizer = optim.Adam(net.parameters(), lr=start_lr)
     milestones=[int(x) for x in milestones.split(',')]
@@ -75,7 +76,7 @@ def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1, oldmode 
             optimizer.load_state_dict(old['optimizer'])
             scheduler = MultiStepLR(optimizer, milestones = milestones, gamma = gamma, last_epoch = epoch-1)
         except KeyError:
-            net = models[backend](27, 32, False)
+            net = models[backend](27, 32)
             _, epoch = os.path.basename(snapshot).split('_')
             epoch = int(epoch)
             net.load_state_dict(load(snapshot))
@@ -87,14 +88,42 @@ def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1, oldmode 
     net = net.cuda()
     return net, optimizer, epoch, scheduler
 
-def movwrite(net, val_on, data_path, save_path):
+def framereader(video_path, dispname):
+    dummyset = getdata.Im_Dataset("./", "asdwef")
+    transform = dummyset.transform # This is bad and I should feel bad
+    cap = cv2.VideoCapture(video_path)
+    ret, inframe = cap.read()
+    framenum = 0
+    while(ret):
+        name = ' '.join([dispname, 'frame', str(framenum)])
+        inframe = inframe.astype(float)/256
+        inframe, _, _ = transform((inframe, [960,540,0], [0,0,0]))
+        inframe = np.flip(inframe,2).copy()
+        x = torch.tensor(inframe.transpose(2,0,1), dtype=torch.float)
+        x = torch.unsqueeze(x,0)
+        yield name, x
+        ret, inframe = cap.read()
+        framenum +=1
+    vid.release()
+    cv2.destroyAllWindows()
+    
+def movwrite(net, val_on=None, data_path=None, save_path=None, video_path=None, dispname=None):
     set1 = [[28,26,228], [184, 126, 55], [74,175,77]]
-    dat = getdata.Im_Dataset(data_path, val_on)
-    if(len(dat)==0):
-        return None
-    dat_loader = DataLoader(dat)
-    dat_iterator = tqdm(dat_loader)
-    dat_iterator.set_description(save_path)
+    if (val_on is not None) and (data_path is not None):
+        dat = getdata.Im_Dataset(data_path, val_on)
+        if(len(dat)==0):
+            return None
+        dat_loader = DataLoader(dat)
+        dat_iterator = tqdm(dat_loader)
+        if(save_path is not None):
+            dat_iterator.set_description(save_path)
+    elif video_path is not None:
+        if dispname is None:
+            dispname = video_path
+        dat_iterator = framereader(video_path, dispname)
+    else:
+        raise ValueError('movwrite needs either a val_on and data_path argument (for frame input) or '
+                         'video_path argument (for video input)')
     #fourcc = cv2.VideoWriter_fourcc(*'XVID')
     #vid = cv2.VideoWriter('.'.join([save_path,'avi']), fourcc, 25, (808, 256))
     pressures = []
@@ -142,25 +171,47 @@ def movwrite(net, val_on, data_path, save_path):
     #cv2.destroyAllWindows()
     return pressures, results
     
-def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights = None):
+def validate(net, val_dat, epoch, alpha, beta, validation_path = None, class_weights = None, corners = None):
     net.eval()
     val_loader = DataLoader(val_dat)
-    seg_criterion = getdata.Circles_Dice()
+    seg_criterion = getdata.Circles_Dice(cropbox=[0,256,0,216])
     cls_criterion = nn.BCEWithLogitsLoss(weight=class_weights)
     val_iterator = tqdm(val_loader)
     results = []
     val_losses = []
     if(validation_path != None):
         os.makedirs(validation_path, exist_ok=True)
-    for name, x, y, y_cls in val_iterator:
-        yc = y[0]
+    for name, x, y, y_cls, *a in val_iterator:
+        if corners == 'together':
+            x, y, y_cls = x.view(-1, x.size(2), x.size(3), x.size(4)), y.view(-1, 6), y_cls.view(-1, 3)
+            a = [a[0].view(-1, 3)]
+        if(validation_path is not None):
+            if corners == 'together':
+                im = io.imread(os.path.join('../joanne/joanne_seg_manual', name[0] + ".png"))[:,320:1600]
+            else:
+                im = x[0].numpy().transpose(1,2,0)
+            yc = y[0]
         x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
         out, out_cls = net(x)
-        outc, out_clsc=out.detach().cpu()[0], out_cls.detach().cpu()[0]
-        #indices = torch.tensor([1,1,1,2,2,1]).cuda()
-        #mults = torch.index_select(y_cls, 1, indices)
-        #seg_loss, cls_loss = seg_criterion(out*mults, y*mults), cls_criterion(out_cls, y_cls)
+        if corners == 'together':
+            out, out_tot = out
+            outc, out_clsc=out_tot.detach().cpu()[0], torch.mean(out_cls,0).detach().cpu()
+        else:
+            outc, out_clsc=out.detach().cpu()[0], out_cls.detach().cpu()[0]
+        if corners == 'shuffle' or corners == 'together':
+            mults = (1-a[0]).cuda()
+            out_cls = out_cls*mults
+            y_cls = y_cls*mults
+            y = torch.cat((y[:,0:2], y[:,2:3]*mults[:,1:2], y[:,3:5], y[:,5:6]*mults[:,2:3]), 1)
+            if class_weights is not None:
+                corr = torch.mean(torch.log(2-mults)*class_weights)
+            else:
+                corr = torch.mean(torch.log(2-mults))
         seg_loss, cls_loss = seg_criterion(out, y), cls_criterion(out_cls, y_cls)
+        if corners == 'together':
+            seg_loss = beta*seg_loss + seg_criterion(out_tot, y[::4])
+        if corners == 'shuffle' or corners == 'together':
+            cls_loss = cls_loss-corr
         loss = seg_loss + alpha * cls_loss
         val_losses.append(loss.data.item())
         if(validation_path == None):
@@ -172,15 +223,16 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
         val_iterator.set_description(status)
         if(validation_path != None):
             fig, (ax1, ax2, ax3) = plt.subplots(nrows=1, ncols=3, figsize=(9,3))
-            imarr = io.imread(os.path.join('../joanne/joanne_seg_manual/', name[0] +'.png'))
-            transim = skimage.transform.rescale(imarr[:,320:1600], 0.4)
             ax1.set_title(name[0])
-            ax1.imshow(transim)
-            if(out_clsc[2]<.1):
-                outs = getdata.circfill(outc[:3], [0,0,0], 512, 432)[0]
+            ax1.imshow(im)
+            h, w = im.shape[0:2]
+            if(corners == 'together'):
+                h, w = int(h*0.4), int(w*0.4)
+            if(out_clsc[2]<0):
+                outs = getdata.circfill(outc[:3], [0,0,0], w, h)[0]
             else:
-                outs = getdata.circfill(outc[:3], outc[3:], 512, 432)[0]
-            trues = getdata.circfill(yc[:3], yc[3:], 512, 432)[0]
+                outs = getdata.circfill(outc[:3], outc[3:], w, h)[0]
+            trues = getdata.circfill(yc[:3], yc[3:], w, h)[0]
             ax2.set_title(' '.join([name[0], 'output']))
             ax2.imshow(outs, cmap='Set1', norm = NoNorm())
             #temp = torch.zeros_like(out[0])
@@ -189,9 +241,13 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
             ax3.set_title(' '.join([name[0], 'truth']))
             ax3.imshow(trues, cmap='Set1', norm = NoNorm())
             fig.text(0.5, 0.05, f'Loss={loss}', horizontalalignment='center', verticalalignment='bottom')
-            fig.savefig(os.path.join(validation_path, '.'.join([name[0],'png'])))
+            if corners=='shuffle':
+                outname = '_'.join([name[0], str(a[1].item())])
+            else:
+                outname = name[0]
+            fig.savefig(os.path.join(validation_path, '.'.join([outname,'png'])))
             plt.close(fig)
-            results.append((name[0], yc, outc, loss.data.item()))
+            results.append((outname, yc, outc, loss.data.item()))
     if(validation_path != None):
         f = open(os.path.join(validation_path,'results'), 'w')
         f.write('\n'.join([f'({name}, {y}, {out}, {loss})' for (name, y, out, loss) in results]))
@@ -203,13 +259,15 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
 
 @click.command()
 @click.option('--data-path', type=str, default=None, help='Path to dataset folder')
-@click.option('--models-path', type=str, help='Path for storing model snapshots')
-@click.option('--backend', type=str, default='resnet34', help='Feature extractor')
+@click.option('--models-path', type=str, default=None, help='Path for storing model snapshots')
+@click.option('--backend', type=str, default='resnet50', help='Feature extractor')
 @click.option('--snapshot', type=str, default=None, help='Path to pretrained weights')
 @click.option('--crop_x', type=int, default=256, help='Horizontal random crop size')
 @click.option('--crop_y', type=int, default=256, help='Vertical random crop size')
+@click.option('--corners', type=str, default=None, help='Mode for splitting into quadrants')
 @click.option('--batch-size', type=int, default=4)
 @click.option('--alpha', type=float, default=1.0, help='Coefficient for classification loss term')
+@click.option('--beta', type=float, default=1.0, help='Coefficient for cornerwise loss term')
 @click.option('--epochs', type=int, default=20, help='Number of training epochs to run')
 @click.option('--gpu', type=str, default='0', help='List of GPUs for parallel training, e.g. 0,1,2,3')
 @click.option('--start-lr', type=float, default=0.001)
@@ -220,14 +278,21 @@ def validate(net, val_dat, epoch, alpha, validation_path = None, class_weights =
 @click.option('--validate-freq', type=int, default=1, help='Validation frequency')
 @click.option('--validate-on', type=str, default=None, help='Validate on a particular subject, e.g. \'51\' or \'46OS\'; overrides other split modifiers')
 @click.option('--name-suffix', type=str, default=None, help='Autogen path names with the given suffix')
-def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
-          alpha, epochs, start_lr, milestones, gpu, train_prop, validation_path,
-          shuffle, validate_freq, validate_on, name_suffix):
-    models_path, validations_path = makenames(models_path, validations_path, name_suffix)
+@click.option('--prev-epoch', type=int, default=None, help='Previous epoch to load')
+
+def ctrain(data_path='', models_path=None, backend='resnet50', snapshot=None, crop_x=256, crop_y=256, corners=None,
+           batch_size=4, alpha=1.0, beta=1.0, epochs=20, start_lr=0.001, milestones='10,20,30', gpu='0', train_prop=0.8,
+           validation_path=None, shuffle=True, validate_freq=1, validate_on=None, name_suffix=None, prev_epoch=None):
+    models_path, validation_path, snapshot = makenames(models_path, validation_path, snapshot,
+                                                       validate_on, backend, name_suffix, prev_epoch)
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     models_path = os.path.abspath(os.path.expanduser(models_path))
     #validation_path = os.path.abspath(os.path.expanduser(validation_path))
     os.makedirs(models_path, exist_ok=True)
+    if(corners == 's'):
+        corners = 'shuffle'
+    if(corners == 't'):
+        corners = 'together'
     
     '''
         To follow this training routine you need a DataLoader that yields the tuples of the following format:
@@ -240,24 +305,29 @@ def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size
     train_loader, class_weights, n_images = None, None, None
     
     # optimizer = optim.Adam(net.parameters(), lr=start_lr)
-    net, optimizer, starting_epoch, scheduler = build_network(snapshot, backend, start_lr, milestones)
+    if snapshot is None:
+        (train_dat, val_dat) = getdata.splitset("../joanne/joanne_seg_manual/", "../joanne/true_avg_circles.json",
+                                                train_prop, shuffle = shuffle, validate_on = validate_on, tame = 'yes',
+                                                corners = corners, coords = True)
+    else:
+        f = open('_'.join([snapshot, 'set']), 'rb')
+        (train_dat, val_dat) = pickle.load(f)
+        train_dat.updateparams()
+        val_dat.updateparams()
+        f.close()
+        corners = train_dat.corners
+    net, optimizer, starting_epoch, scheduler = build_network(snapshot, backend, start_lr, milestones, corners=corners)
     #scheduler = MultiStepLR(optimizer, milestones=[int(x) for x in milestones.split(',')])
     #scheduler = ExponentialLR(optimizer, 0.8)
     
     
-    if snapshot is None:
-        (train_dat, val_dat) = getdata.splitset("../joanne/joanne_seg_manual/", "../joanne/true_avg_circles.json",
-                                                train_prop, shuffle = shuffle, validate_on = validate_on, tame = 'yes',
-                                                fill = True, coords = True)
-    else:
-        f = open('_'.join([snapshot, 'set']), 'rb')
-        (train_dat, val_dat) = pickle.load(f)
-        f.close()
-    train_loader = DataLoader(train_dat, shuffle=True, batch_size = batch_size)
+    
+    if corners == 'together':
+        batch_size = batch_size//4
+    train_loader = DataLoader(train_dat, shuffle=True, batch_size = batch_size, drop_last = True)
     
     train_losses = []
     val_losses = []
-    
     
     for epoch in range(starting_epoch, starting_epoch + epochs):
         seg_criterion = getdata.Circles_Dice()
@@ -267,16 +337,31 @@ def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size
         train_iterator = tqdm(train_loader)
         scheduler.step()
         net.train()
-        for name, x, y, y_cls in train_iterator:
+        for name, x, y, y_cls, *a in train_iterator:
             optimizer.zero_grad()
             x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
+            if corners == 'together':
+                x, y, y_cls = x.view(-1, x.size(2), x.size(3), x.size(4)), y.view(-1, 6), y_cls.view(-1, 3)
+                a = [a[0].view(-1, 3)]
             out, out_cls = net(x)
-            #indices = torch.tensor([1,1,1,2,2,2]).cuda()
-            #mults = torch.index_select(y_cls, 1, indices)
-            #seg_loss, cls_loss = seg_criterion(out*mults, y*mults), cls_criterion(out_cls, y_cls)
+            if corners == 'together':
+                out, out_tot = out
+            if corners == 'shuffle' or corners == 'together':
+                mults = (1-a[0]).cuda()
+                out_cls = out_cls*mults
+                y_cls = y_cls*mults
+                y = torch.cat((y[:,0:2], y[:,2:3]*mults[:,1:2], y[:,3:5], y[:,5:6]*mults[:,2:3]), 1)
+                if class_weights is not None:
+                    corr = torch.mean(torch.log(2-mults)*class_weights)
+                else:
+                    corr = torch.mean(torch.log(2-mults))
+                
             seg_loss, cls_loss = seg_criterion(out, y), cls_criterion(out_cls, y_cls)
+            if corners == 'together':
+                seg_loss = beta*seg_loss + q*seg_criterion(out_tot, y[::4])
+            if corners == 'shuffle' or corners == 'together':
+                cls_loss = cls_loss - corr
             loss = seg_loss + alpha * cls_loss
-            
             epoch_losses.append(loss.data.item())
             status = '[{0}] loss = {1:0.5f} avg = {2:0.5f}, LR = {3:0.7f}'.format(
                 epoch + 1, loss.data.item(), np.mean(epoch_losses), scheduler.get_lr()[0])
@@ -294,34 +379,38 @@ def ctrain(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size
         f.close()
         train_losses.append(np.mean(epoch_losses))
         if((epoch+1) % validate_freq == 0 and epoch != starting_epoch + epochs - 1):
-            val_losses.append(validate(net, val_dat, epoch, alpha, class_weights = class_weights))
+            val_losses.append(validate(net, val_dat, epoch, alpha, beta, class_weights = class_weights, corners=corners))
         
-    val_losses.append(validate(net, val_dat, starting_epoch + epochs - 1, alpha, validation_path, class_weights))
+    val_losses.append(validate(net, val_dat, starting_epoch + epochs - 1, alpha, beta,
+                               validation_path, class_weights, corners))
     
     return {'train':train_losses, 'validate':val_losses}
     
 if __name__ == '__main__':
-
     ctrain()
     '''
+    set1 = [[28,26,228], [184, 126, 55], [74,175,77]]
     os.environ["CUDA_VISIBLE_DEVICES"] = '0'
     net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50nump/PSPNet_30', 'resnet50', 0.001, '10,20,30')
-    net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50num/PSPNet_17', 'resnet50', 0.001, '10,20,30')
-    ans = {}
-    resultsdict = {}
-    for x in videolist:
-        for y in ['OD', 'OS']:
-            ps = movwrite(net, '_'.join([x,y]), '../../yue/joanne/video_frames_test/', '_'.join(['circs',x,y]))
-            if ps is not None:
-                pressures, results = ps
-                ans['_'.join([x,y])] = pressures
-                resultsdict['_'.join([x,y])] = results
-    #f = open('pressures.json', 'w')
-    #json.dump(ans, f)
-    #f.close()
-    f = open('results.json', 'w')
-    json.dump(resultsdict, f)
-    f.close()
+    #net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50num/PSPNet_17', 'resnet50', 0.001, '10,20,30')
+    net.eval()
+    torch.set_grad_enabled(False)
+    basepath = '../../yue/joanne/videos/'
+    dummyset = getdata.Im_Dataset("./", "asdwef")
+    transform = dummyset.transform
+    '''
+    '''
+    for n in range(50,71):
+        for folder in [fol for fol in os.listdir(basepath) if fol[3:5]==str(n)]:
+            for f in os.listdir(os.path.join(basepath,folder)):
+                if(n == 52 or n == 53 or n == 54):
+                    dispname = ' - '.join([('iP0'+str(n)), f[0:-4]])
+                elif(n == 58):
+                    dispname = f[0:-4]
+                elif(n<52):
+                    dispname = f[0:8]
+                else:
+                    dispname = f.split(' - ')[0]
     '''
     
     '''

@@ -24,7 +24,6 @@ class PSPModule(nn.Module):
         bottle = self.bottleneck(torch.cat(priors, 1))
         return self.relu(bottle)
 
-
 class PSPUpsample(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -38,7 +37,6 @@ class PSPUpsample(nn.Module):
         h, w = 2 * x.size(2), 2 * x.size(3)
         p = F.upsample(input=x, size=(h, w), mode='bilinear')
         return self.conv(p)
-
 
 class PSPNet(nn.Module):
     def __init__(self, n_classes=3, sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet34',
@@ -84,7 +82,7 @@ class PSPNet(nn.Module):
         
 class PSPCircs(nn.Module):
     def __init__(self, n_classes=3, sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet34',
-                 pretrained=True, w=64, h=54, extraend=True):
+                 pretrained=True, w=64, h=54, extraend=False, combinecorners=False):
         super().__init__()
         self.feats = getattr(extractors, backend)(pretrained)
         self.psp = PSPModule(psp_size, 1024, sizes)
@@ -113,6 +111,10 @@ class PSPCircs(nn.Module):
             nn.Linear(256, n_classes)
         )
         
+        self.combinecorners = combinecorners
+        if(combinecorners):
+            self.combiner = QuadCombine()
+        
     def _convlayer(self, inchannels, outchannels):
         return nn.Sequential(nn.Conv2d(inchannels, outchannels, 3, padding=1),
                                        nn.BatchNorm2d(outchannels),
@@ -120,15 +122,19 @@ class PSPCircs(nn.Module):
                                        nn.Dropout2d(p=0.15))
         
     def forward(self, x):
-        f, class_f = self.feats(x) 
+        f, class_f = self.feats(x)
         p = self.psp(f)
         p = self.drop_1(p)
         p = self.conv1(p)
         p = self.conv2(p)
         p = self.conv3(p)
         p = self.fin(p)
+        p = p.view(-1,6)
         auxiliary = F.adaptive_max_pool2d(input=class_f, output_size=(1, 1)).view(-1, class_f.size(1))
-        return p.view(-1,6), self.classifier(auxiliary)
+        if(self.combinecorners):
+            q = self.combiner(p, self.classifier(auxiliary))
+            return (p, q), self.classifier(auxiliary)
+        return p, self.classifier(auxiliary)
         
 class PSPDual(nn.Module):
     def __init__(self, n_classes=3, sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet34',
@@ -181,3 +187,39 @@ class PSPDual(nn.Module):
         auxiliary = F.adaptive_max_pool2d(input=class_f, output_size=(1, 1)).view(-1, class_f.size(1))
 
         return self.segout(p), self.numout(p).view(-1,6), self.classifier(auxiliary)
+        
+class QuadCombine(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dense1 = self._denselayer(36,64)
+        self.dense2 = self._denselayer(64,64)
+        self.fin = nn.Linear(64, 6)
+        
+    def forward(self, x, x_cls):
+        y = torch.cat((x.view(-1,24), x_cls.view(-1,12)),1)
+        y = self.dense1(y)
+        y = self.dense2(y)
+        y = self.fin(y)
+        return y
+        
+    def _denselayer(self, infeats, outfeats):
+        return nn.Sequential(nn.Linear(infeats, outfeats),
+                             nn.BatchNorm1d(outfeats),
+                             nn.ReLU(),
+                             nn.Dropout(p=0.15))
+                             
+class DrawCirc(nn.Module):
+    def __init__(self, w=64, h=54, phi=1, psi=1):
+        yy, xx = np.mgrid[0:h][0:w]
+        self.yy = torch.tensor(yy, dtype=torch.float, requires_grad=False)
+        self.xx = torch.tensor(xx, dtype=torch.float, requires_grad=False)
+        self.phi = phi
+        self.psi = psi
+        self.ls = nn.LogSoftmax(dim=0)
+    def forward(self, xl, yl, rl, xi, yi, ri, inpres):
+        lens = self.phi*(r1 - ((self.xx-x1)**2 + (self.yy-y1)**2)/r1)
+        if inpres:
+            inner = lens + self.psi*(r2 - ((self.xx-x2)**2 + (self.yy-y2)**2)/r2)*(lens>0).float() - self.psi*(lens<=0).float()
+        else:
+            inner = -torch.ones_like(lens)*self.psi-F.relu(-lens)
+        return self.ls(torch.stack((torch.zeros_like(inner), lens, inner), dim=0))
