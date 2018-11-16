@@ -33,17 +33,25 @@ sys.path.insert(0, "../pressure-seg")
 import getdata
 
 models = {
-    'squeezenet': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet', w=w, h=h, combinecorners=(corners=='together')),
-    'densenet': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet', w=w, h=h, combinecorners=(corners=='together')),
-    'resnet18': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18', w=w, h=h, combinecorners=(corners=='together')),
-    'resnet34': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34', w=w, h=h, combinecorners=(corners=='together')),
-    'resnet50': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50', w=w, h=h, combinecorners=(corners=='together')),
-    'resnet101': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101', w=w, h=h, combinecorners=(corners=='together')),
-    'resnet152': lambda h, w, corners: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152', w=w, h=h, combinecorners=(corners=='together'))
+    'squeezenet': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet', w=w, h=h),
+    'densenet': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet', w=w, h=h),
+    'resnet18': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18', w=w, h=h),
+    'resnet34': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34', w=w, h=h),
+    'resnet50': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50', w=w, h=h),
+    'resnet101': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101', w=w, h=h),
+    'resnet152': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152', w=w, h=h)
 }
                 
 videolist = ['58', '61', '62', '65', '66', '69', '71']
 num_classes = 3
+    
+def accumulate_values(dict1, dict2):
+    for (k,v) in dict2.items():
+        if k in dict1:
+            dict1[k].append(v)
+        else:
+            dict1[k] = [v]
+    return dict1
     
 def makenames(models_path, validation_path, snapshot, validate_on, backend, name_suffix, prev_epoch):
     if models_path is None and name_suffix is None:
@@ -61,10 +69,10 @@ def makenames(models_path, validation_path, snapshot, validate_on, backend, name
         snapshot = os.path.join(models_path, '_'.join(['PSPNet', str(prev_epoch)]))
     return models_path, validation_path, snapshot
     
-def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1, oldmode = False, corners=None):
+def build_network(snapshot, backend, start_lr, milestones, gamma = 0.1, oldmode = False):
     epoch = 0
     backend = backend.lower()
-    net = models[backend](27, 32, corners)
+    net = models[backend](27, 32)
     net = nn.DataParallel(net)
     optimizer = optim.Adam(net.parameters(), lr=start_lr)
     milestones=[int(x) for x in milestones.split(',')]
@@ -104,8 +112,6 @@ def framereader(video_path, dispname):
         yield name, x
         ret, inframe = cap.read()
         framenum +=1
-    vid.release()
-    cv2.destroyAllWindows()
     
 def movwrite(net, val_on=None, data_path=None, save_path=None, video_path=None, dispname=None):
     set1 = [[28,26,228], [184, 126, 55], [74,175,77]]
@@ -124,21 +130,20 @@ def movwrite(net, val_on=None, data_path=None, save_path=None, video_path=None, 
     else:
         raise ValueError('movwrite needs either a val_on and data_path argument (for frame input) or '
                          'video_path argument (for video input)')
-    #fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    #vid = cv2.VideoWriter('.'.join([save_path,'avi']), fourcc, 25, (808, 256))
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    vid = cv2.VideoWriter('.'.join([save_path,'avi']), fourcc, 25, (808, 256))
     pressures = []
     results = []
     net.eval()
     torch.set_grad_enabled(False)
     for name, x in dat_iterator:
-        xv = Variable(x).cuda()
+        xv = Variable(getdata.histeqtens(x)).cuda()
         out, out_cls = net(xv)
         outc = out.detach().cpu()[0]
         outc = torch.abs(outc)
         im_arr = (x[0]*256).numpy().astype('uint8')
         im_arr = np.flip(im_arr,0).transpose(1,2,0)
         lr = outc[2]
-        '''
         if(out_cls[0,2]>0.5):
             out_arr = np.array(getdata.circfill(outc[:3], outc[3:], width=256, height=216, style=set1, classes=False)).astype('uint8')
             circover = np.array(getdata.circdraw(outc[:3], outc[3:], width=256, height=216, thickness=1, style=[[0,0,0],[255,255,255]], classes=False)).astype('uint8')
@@ -153,52 +158,50 @@ def movwrite(net, val_on=None, data_path=None, save_path=None, video_path=None, 
         frame[10:226, 542:798] = cv2.max(im_arr, circover)
         cv2.putText(frame, f'{name[0]}', (246, 248), 0, 0.8, (0,0,0))
         vid.write(frame)
-        '''
+        
         if(out_cls[0,2]>0.5):
             ir = outc[5]
         else:
             ir = torch.tensor(0)
         pressures.append(getdata.calc_iop_from_circles(lr.item(),ir.item()))
-        results.append(outc.numpy())
+        results.append(outc.numpy().tolist())
     torch.set_grad_enabled(True)
-    #fig, ax = plt.subplots()
-    #ax.plot(pressures)
-    #ax.set_xlabel('Frame')
-    #ax.set_ylabel('Pressure (mm Hg)')
-    #ax.set_ylim(0,30)
-    #fig.savefig('.'.join([save_path,'png']))
-    #vid.release()
-    #cv2.destroyAllWindows()
+    fig, ax = plt.subplots()
+    ax.plot(pressures)
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('Pressure (mm Hg)')
+    ax.set_ylim(0,30)
+    fig.savefig('.'.join([save_path,'png']))
+    vid.release()
+    cv2.destroyAllWindows()
     return pressures, results
     
-def validate(net, val_dat, epoch, alpha, beta, validation_path = None, class_weights = None, corners = None):
+def writeresults(net, dat, epoch, alpha, beta, class_weights = None, corners = None, oldres = None):
+    newres = validate(net, dat, epoch, alpha, beta, class_weights = class_weights, corners=corners, writeout=True)
+    if oldres is not None:
+        newres = accumulate_values(oldres, newres)
+    return newres
+    
+def validate(net, val_dat, epoch, alpha, beta, validation_path = None, class_weights = None, corners = None, writeout = None):
     net.eval()
     val_loader = DataLoader(val_dat)
-    seg_criterion = getdata.Circles_Dice(cropbox=[0,256,0,216])
+    seg_criterion = getdata.Circles_Dice()
     cls_criterion = nn.BCEWithLogitsLoss(weight=class_weights)
     val_iterator = tqdm(val_loader)
     results = []
     val_losses = []
     if(validation_path != None):
         os.makedirs(validation_path, exist_ok=True)
+    if writeout:
+        calcres = {}
     for name, x, y, y_cls, *a in val_iterator:
-        if corners == 'together':
-            x, y, y_cls = x.view(-1, x.size(2), x.size(3), x.size(4)), y.view(-1, 6), y_cls.view(-1, 3)
-            a = [a[0].view(-1, 3)]
         if(validation_path is not None):
-            if corners == 'together':
-                im = io.imread(os.path.join('../joanne/joanne_seg_manual', name[0] + ".png"))[:,320:1600]
-            else:
-                im = x[0].numpy().transpose(1,2,0)
+            im = x[0].numpy().transpose(1,2,0)
             yc = y[0]
         x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
         out, out_cls = net(x)
-        if corners == 'together':
-            out, out_tot = out
-            outc, out_clsc=out_tot.detach().cpu()[0], torch.mean(out_cls,0).detach().cpu()
-        else:
-            outc, out_clsc=out.detach().cpu()[0], out_cls.detach().cpu()[0]
-        if corners == 'shuffle' or corners == 'together':
+        outc, out_clsc=out.detach().cpu()[0], out_cls.detach().cpu()[0]
+        if corners == 'shuffle':
             mults = (1-a[0]).cuda()
             out_cls = out_cls*mults
             y_cls = y_cls*mults
@@ -208,9 +211,7 @@ def validate(net, val_dat, epoch, alpha, beta, validation_path = None, class_wei
             else:
                 corr = torch.mean(torch.log(2-mults))
         seg_loss, cls_loss = seg_criterion(out, y), cls_criterion(out_cls, y_cls)
-        if corners == 'together':
-            seg_loss = beta*seg_loss + seg_criterion(out_tot, y[::4])
-        if corners == 'shuffle' or corners == 'together':
+        if corners == 'shuffle':
             cls_loss = cls_loss-corr
         loss = seg_loss + alpha * cls_loss
         val_losses.append(loss.data.item())
@@ -226,8 +227,6 @@ def validate(net, val_dat, epoch, alpha, beta, validation_path = None, class_wei
             ax1.set_title(name[0])
             ax1.imshow(im)
             h, w = im.shape[0:2]
-            if(corners == 'together'):
-                h, w = int(h*0.4), int(w*0.4)
             if(out_clsc[2]<0):
                 outs = getdata.circfill(outc[:3], [0,0,0], w, h)[0]
             else:
@@ -248,13 +247,22 @@ def validate(net, val_dat, epoch, alpha, beta, validation_path = None, class_wei
             fig.savefig(os.path.join(validation_path, '.'.join([outname,'png'])))
             plt.close(fig)
             results.append((outname, yc, outc, loss.data.item()))
+        if writeout:
+            if corners=='shuffle':
+                outname = '_'.join([name[0], str(a[1].item())])
+            else:
+                outname = name[0]
+            calcres[outname] = (outc.numpy().tolist(), out_clsc.numpy().tolist())
     if(validation_path != None):
         f = open(os.path.join(validation_path,'results'), 'w')
         f.write('\n'.join([f'({name}, {y}, {out}, {loss})' for (name, y, out, loss) in results]))
         f.close()
         val_loss = np.mean(val_losses)
         print(f'Validation loss: {val_loss}')
-    return np.mean(val_losses)
+    if writeout:
+        return calcres
+    else:
+        return np.mean(val_losses)
     
 
 @click.command()
@@ -289,6 +297,7 @@ def ctrain(data_path='', models_path=None, backend='resnet50', snapshot=None, cr
     models_path = os.path.abspath(os.path.expanduser(models_path))
     #validation_path = os.path.abspath(os.path.expanduser(validation_path))
     os.makedirs(models_path, exist_ok=True)
+    os.makedirs(validation_path, exist_ok=True)
     if(corners == 's'):
         corners = 'shuffle'
     if(corners == 't'):
@@ -310,24 +319,31 @@ def ctrain(data_path='', models_path=None, backend='resnet50', snapshot=None, cr
                                                 train_prop, shuffle = shuffle, validate_on = validate_on, tame = 'yes',
                                                 corners = corners, coords = True)
     else:
-        f = open('_'.join([snapshot, 'set']), 'rb')
-        (train_dat, val_dat) = pickle.load(f)
+        with open('_'.join([snapshot, 'set']), 'rb') as f:
+            (train_dat, val_dat) = pickle.load(f)
         train_dat.updateparams()
         val_dat.updateparams()
-        f.close()
         corners = train_dat.corners
-    net, optimizer, starting_epoch, scheduler = build_network(snapshot, backend, start_lr, milestones, corners=corners)
+    net, optimizer, starting_epoch, scheduler = build_network(snapshot, backend, start_lr, milestones)
     #scheduler = MultiStepLR(optimizer, milestones=[int(x) for x in milestones.split(',')])
     #scheduler = ExponentialLR(optimizer, 0.8)
     
     
     
-    if corners == 'together':
-        batch_size = batch_size//4
     train_loader = DataLoader(train_dat, shuffle=True, batch_size = batch_size, drop_last = True)
     
-    train_losses = []
-    val_losses = []
+    if(starting_epoch>0):
+        try:
+            with open(os.path.join(validation_path, 'Training_curve.json')) as f:
+                prevres = json.load(f)
+            train_losses = prevres['train'][:starting_epoch]
+            val_losses = prevres['validate'][:starting_epoch]
+        except FileNotFoundError:
+            train_losses = [f'Results from epochs up to {starting_epoch} not found']
+            val_losses = [f'Results from epochs up to {starting_epoch} not found']
+    else:
+        train_losses = []
+        val_losses = []
     
     for epoch in range(starting_epoch, starting_epoch + epochs):
         seg_criterion = getdata.Circles_Dice()
@@ -340,13 +356,8 @@ def ctrain(data_path='', models_path=None, backend='resnet50', snapshot=None, cr
         for name, x, y, y_cls, *a in train_iterator:
             optimizer.zero_grad()
             x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
-            if corners == 'together':
-                x, y, y_cls = x.view(-1, x.size(2), x.size(3), x.size(4)), y.view(-1, 6), y_cls.view(-1, 3)
-                a = [a[0].view(-1, 3)]
             out, out_cls = net(x)
-            if corners == 'together':
-                out, out_tot = out
-            if corners == 'shuffle' or corners == 'together':
+            if corners == 'shuffle':
                 mults = (1-a[0]).cuda()
                 out_cls = out_cls*mults
                 y_cls = y_cls*mults
@@ -357,8 +368,8 @@ def ctrain(data_path='', models_path=None, backend='resnet50', snapshot=None, cr
                     corr = torch.mean(torch.log(2-mults))
                 
             seg_loss, cls_loss = seg_criterion(out, y), cls_criterion(out_cls, y_cls)
-            if corners == 'together':
-                seg_loss = beta*seg_loss + q*seg_criterion(out_tot, y[::4])
+            #if corners == 'together':
+                #seg_loss = beta*seg_loss + seg_criterion(out_tot, y[::4])
             if corners == 'shuffle' or corners == 'together':
                 cls_loss = cls_loss - corr
             loss = seg_loss + alpha * cls_loss
@@ -380,50 +391,31 @@ def ctrain(data_path='', models_path=None, backend='resnet50', snapshot=None, cr
         train_losses.append(np.mean(epoch_losses))
         if((epoch+1) % validate_freq == 0 and epoch != starting_epoch + epochs - 1):
             val_losses.append(validate(net, val_dat, epoch, alpha, beta, class_weights = class_weights, corners=corners))
+        with open(os.path.join(validation_path, 'Training_curve.json'), 'w') as f:
+            json.dump({'train':train_losses, 'validate':val_losses}, f)
         
     val_losses.append(validate(net, val_dat, starting_epoch + epochs - 1, alpha, beta,
                                validation_path, class_weights, corners))
     
+    if epochs>0:
+        with open(os.path.join(validation_path, 'Training_curve.json'), 'w') as f:
+            json.dump({'train':train_losses, 'validate':val_losses}, f)
     return {'train':train_losses, 'validate':val_losses}
     
 if __name__ == '__main__':
-    ctrain()
-    '''
-    set1 = [[28,26,228], [184, 126, 55], [74,175,77]]
-    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-    net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50nump/PSPNet_30', 'resnet50', 0.001, '10,20,30')
-    #net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50num/PSPNet_17', 'resnet50', 0.001, '10,20,30')
-    net.eval()
-    torch.set_grad_enabled(False)
-    basepath = '../../yue/joanne/videos/'
-    dummyset = getdata.Im_Dataset("./", "asdwef")
-    transform = dummyset.transform
-    '''
-    '''
-    for n in range(50,71):
-        for folder in [fol for fol in os.listdir(basepath) if fol[3:5]==str(n)]:
-            for f in os.listdir(os.path.join(basepath,folder)):
-                if(n == 52 or n == 53 or n == 54):
-                    dispname = ' - '.join([('iP0'+str(n)), f[0:-4]])
-                elif(n == 58):
-                    dispname = f[0:-4]
-                elif(n<52):
-                    dispname = f[0:8]
-                else:
-                    dispname = f.split(' - ')[0]
-    '''
+    #ctrain()
     
-    '''
-    f = open('pressures.json')
-    fpress = json.load(f)
-    for (k,v) in fpress.items():
-        fig, ax = plt.subplots()
-        ax.plot(v)
-        ax.set_xlabel('Frame')
-        ax.set_ylabel('Pressure (mm Hg)')
-        ax.set_ylim(0,30)
-        ax.minorticks_on()
-        ax.grid(True)
-        ax.grid(True, 'minor', 'y', color='#CCCCCC', linewidth=0.5)
-        fig.savefig('_'.join(['circs',k])+'.png')
-    '''
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+    net, optimizer, starting_epoch, scheduler = build_network('snaps_29_50nums_histeq/PSPNet_13', 'resnet50', 0.001, '10,20,30')
+    filepath = '../../yue/joanne/Ocular Manometry 31Oct2018/Eye 2 Ascending'
+    files = os.listdir(filepath)
+    for filename in files:
+        if filename[3] == 'P':
+            continue
+        dispname = ' '.join(filename.split()[:3])
+        pressures, results = movwrite(net, save_path = os.path.join('manometry', dispname),
+                                      video_path = os.path.join(filepath, filename), dispname = dispname)
+        #with open(f'manometry/{dispname}_results.json','w') as f:
+        #    json.dump(results, f)
+        #with open(f'manometry/{dispname}_pressures.json','w') as f:
+        #    json.dump(pressures, f)

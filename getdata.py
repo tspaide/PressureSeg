@@ -10,6 +10,7 @@ from matplotlib.patches import Circle
 from matplotlib.collections import PatchCollection
 from matplotlib.colors import NoNorm
 import skimage.transform
+import skimage.exposure
 from skimage import io
 import PIL
 
@@ -126,7 +127,7 @@ def dice_circle_loss(circa, circb, epsilon=0.001, size_average=True, reduce = Tr
                 over = circareas.cropcircoverlap(xa,ya,ra,xb,yb,rb, *cropbox)
                 if(over==0 and missloss):
                     d = ((xa-xb)**2 + (ya-yb)**2)**0.5
-                    over = ra + rb - d
+                    over = torch.min(ra + rb - d, over)
                 areaa = circareas.cropcircarea(xa,ya,ra, *cropbox)
                 areab = circareas.cropcircarea(xb,yb,rb, *cropbox)
                 area = areaa+areab
@@ -778,6 +779,22 @@ class Pad():
         (lx, ly, lr) = lens_data
         (ix, iy, ir) = inner_data
         return np.pad(image, ((self.y, self.y), (self.x, self.x), (0,0)), 'edge'), (lx+self.x,ly+self.y,lr), (ix+self.x,iy+self.y,ir)
+    
+class HistEq():
+    def __call__(self, im_arr, lens_data = None, inner_data = None):
+        if lens_data is None:
+            im_arr, lens_data, inner_data = im_arr
+        for n in range(3):
+            im_arr[:,:,n] = skimage.exposure.equalize_hist(im_arr[:,:,n])*256
+        return im_arr, lens_data, inner_data
+   
+def histeqtens(x):
+    x_arr = x[0].numpy().copy()
+    for n in range(3):
+        x_arr[n] = skimage.exposure.equalize_hist(x_arr[n])
+    x = torch.tensor(x_arr, dtype=torch.float)
+    x = torch.unsqueeze(x,0)
+    return x
    
 def splitset(img_dir, circle_file, train_prop = 0.8, shuffle = False, seed = None, validate_on = None,
              tame = 'yes', fill = True, coords = False, dual = False, corners = None):
@@ -818,10 +835,10 @@ def splitset(img_dir, circle_file, train_prop = 0.8, shuffle = False, seed = Non
         #val_trans = transforms.Compose([Crop(320,0,1600,1080), Rescale(0.2)])
         scalings = [transforms.Compose([PadP(320, 270), RandomResizedCropP(256, 216, 0.134, 0.2)]),
                     RandomResizedCropP(256, 216, 0.2)]
-        train_trans = transforms.Compose([ToPil(), RandRotateP(15, resizing=True),
+        train_trans = transforms.Compose([HistEq(), ToPil(), RandRotateP(15, resizing=True),
                                           transforms.RandomChoice(scalings), ToTens()])
                                           #transforms.RandomChoice(scalings), transforms.RandomApply([FlipP()]), ToTens()])
-        val_trans = transforms.Compose([ToPil(), CropP(320,0,1600,1080), ResizeP(216), ToTens()])
+        val_trans = transforms.Compose([HistEq(), ToPil(), CropP(320,0,1600,1080), ResizeP(216), ToTens()])
     else:
         train_trans = transforms.Compose([RandRescale(.25,.3), RandRotate(15), RandomCrop(256, 256, tame)])
         val_trans = transforms.Compose([Crop(448,28,1472,1052), Rescale(0.25)])
@@ -963,6 +980,7 @@ class Coord_Dataset(Dataset):
         self.img_dir = img_dir
         self.transform = transform
         self.corners = corners
+        self.starttime = time.time()
         
     def __len__(self):
         if self.corners=='shuffle':
