@@ -105,7 +105,6 @@ def sketch(width,height,line_angle,outer_x,outer_y,outer_r,
     else:
         topres, botres = None, None
         
-      
     # Colors
     if color_mode=='rand':
         color_mode = np.random.randint(coltypes.shape[0])
@@ -152,7 +151,7 @@ def sketch(width,height,line_angle,outer_x,outer_y,outer_r,
              'central_feature':central_feature, 'sides':sides, 'featdist':featdist}
     return out, gen_info, masks
     
-def goldmann_fake(innerprob=3885/5099, extra=False):
+def goldmann_fake(innerprob=3885/5099, extra=False, color_mode='rand', bothmires=True, midline=False):
     top_x, top_y = 552+np.random.normal()*67, 1072+np.random.normal()*55
     line_angle = 0.05*np.random.normal()
     top_r = 246+np.random.normal()*10
@@ -186,43 +185,52 @@ def goldmann_fake(innerprob=3885/5099, extra=False):
     im,gen_info,masks = sketch(1080,1920,line_angle,outer_x,outer_y,outer_r,
                                top_x,top_y,outer_thickness_top,bot_x,bot_y,outer_thickness_bot,shift,
                                inner_x,inner_y,inner_r,inner_thickness,drawinnercirc,False,noise=0.01,circshiftmult=1.4,
-                               color_mode='rand',coltypes=coltypes)
+                               color_mode=color_mode,coltypes=coltypes)
     shadow_range = 0.1+np.random.sample()*3
     shadow_mask = np.clip((masks['outdist']/outer_r-1.2)/shadow_range,0,1)
     if np.random.random_sample()<0.5: # Other ways to do this?
         switch = 1
     else:
         switch = 0
-    if not drawinnercirc:
-        ix,iy,ir = 0,0,0
-    elif switch:
-        ix,iy,ir = inner_x+shift*np.cos(line_angle),inner_y+shift*np.sin(line_angle),inner_r
+    if bothmires:
+        if not drawinnercirc:
+            ixl,iyl,irl,ixr,iyr,irr = 0,0,0,0,0,0
+        else:
+            ixl,iyl,irl = inner_x-shift*np.cos(line_angle),inner_y-shift*np.sin(line_angle),inner_r
+            ixr,iyr,irr = inner_x+shift*np.cos(line_angle),inner_y+shift*np.sin(line_angle),inner_r
+        inner_dat = ixl,iyl,irl,ixr,iyr,irr
     else:
-        ix,iy,ir = inner_x-shift*np.cos(line_angle),inner_y-shift*np.sin(line_angle),inner_r
-    return (im*(1-shadow_mask)).astype(np.uint8), (top_x,top_y,top_r,ix,iy,ir,switch)
-    #return (im*(1-shadow_mask)).astype(np.uint8), (top_x,top_y,top_r,ix,iy,ir,switch,line_angle,outer_x,outer_y) # Trying midline segmentation
+        if not drawinnercirc:
+            inner_dat = 0,0,0
+        elif switch:
+            inner_dat = inner_x+shift*np.cos(line_angle),inner_y+shift*np.sin(line_angle),inner_r
+        else:
+            inner_dat = inner_x-shift*np.cos(line_angle),inner_y-shift*np.sin(line_angle),inner_r
+    if midline:
+        line_dat = line_angle,outer_x,outer_y
+    else:
+        line_dat = ()
+    return (im*(1-shadow_mask)).astype(np.uint8), (top_x,top_y,top_r,*inner_dat,0.5,*line_dat)
     
 if __name__=='__main__':
-    quit()
     for n in range(5):
-        im, coords = goldmann_fake(extra=n%2)
+        im, coords = goldmann_fake(extra=(n+1)%2, color_mode='randcomb')
         yy,xx,_ = np.mgrid[0:im.shape[0],0:im.shape[1],0:1]
-        outx,outy,outr,inx,iny,inr,s,la,ox,oy = coords
-        m = np.tan(la)
-        b = oy-m*ox
+        outx,outy,outr,inxl,inyl,inrl,inxr,inyr,inrr,s = coords
+
         outcirc = (abs(((xx-outx)**2+(yy-outy)**2)**0.5-outr)<2).astype(np.uint8)
-        if s:
-            valreg = (yy>m*xx+b)
+
+        if inrl:
+            incircl = (abs(((xx-inxl)**2+(yy-inyl)**2)**0.5-inrl)<2).astype(np.uint8)
         else:
-            valreg = (yy<m*xx+b)
-        midline = (abs(yy-m*xx-b)<2).astype(np.uint8)
-        if inr:
-            incirc = (abs(((xx-inx)**2+(yy-iny)**2)**0.5-inr)<2).astype(np.uint8)*valreg
+            incircl = np.zeros_like(outcirc)
+        if inrr:
+            incircr = (abs(((xx-inxr)**2+(yy-inyr)**2)**0.5-inrr)<2).astype(np.uint8)
         else:
-            incirc = np.zeros_like(outcirc)
-        im = im.astype(np.uint8)|(outcirc*np.array([255,0,0],dtype=np.uint8))|(incirc*np.array([0,255,255],dtype=np.uint8))|(midline*np.array([255,255,255],dtype=np.uint8))
+            incircr = np.zeros_like(outcirc)
+        im = im.astype(np.uint8)*(1-(outcirc|incircr|incircl))|(outcirc*np.array([255,0,0],dtype=np.uint8))|(incircl*np.array([0,255,255],dtype=np.uint8))|(incircr*np.array([255,255,0],dtype=np.uint8))
         print(s)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            io.imsave(f'fakegoldex{n}.png', im, check_contrast=False)
+            io.imsave(f'fakegoldexnoline{n}.png', im, check_contrast=False)
         

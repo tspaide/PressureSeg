@@ -5,6 +5,7 @@ import json
 import pickle
 import warnings
 
+from matplotlib import rcParams
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from matplotlib.collections import PatchCollection
@@ -88,7 +89,7 @@ def overlap(circa, circb, missloss = False):
     
     d2 = (circa[0]-circb[0])**2 + (circa[1]-circb[1])**2
     d = torch.pow(d2, 0.5)
-    if d <= torch.abs(R-r):
+    if d2 <= (R-r)**2: # May be more stable
         # One circle is entirely enclosed in the other.
         return np.pi * torch.min(R, r)**2, True
     if d >= r + R:
@@ -120,6 +121,17 @@ def dice_circle_loss(circa, circb, epsilon=0.001, size_average=True, reduce = Tr
             if cropbox is None:
                 over, cont = overlap(circa[n], circb[n], missloss)
                 area = np.pi*(circa[n,2]**2+circb[n,2]**2)
+                if torch.isnan(over):
+                    torch.set_printoptions(precision=20)
+                    print('nan overlap')
+                    print(circa[n])
+                    print(circb[n])
+                    quit()
+                if torch.isnan(area):
+                    print('nan area')
+                    print(circa[n])
+                    print(circb[n])
+                    quit()
             else:
                 cropbox = torch.tensor(cropbox, dtype=torch.float, device=circa.device)
                 xa, ya, ra = circa[n,0], circa[n,1], torch.abs(circa[n,2])
@@ -134,6 +146,12 @@ def dice_circle_loss(circa, circb, epsilon=0.001, size_average=True, reduce = Tr
                 if((areaa==circareas.boxarea(*cropbox) or areab==circareas.boxarea(*cropbox)) and missloss):
                     over = over-torch.abs(ra-rb)
             dices[n]=(2*over+epsilon)/(area+epsilon)
+            if torch.isnan(dices[n]):
+                print('nan dice score')
+                print(over)
+                print(area)
+                print(epsilon)
+                quit()
             if addloss is not None:
                 dices[n] += addloss[n]
     if(negate):
@@ -158,13 +176,42 @@ class Circles_Dice():
         self.reduce = reduce
         self.missloss = missloss
         self.cropbox = cropbox
-    def __call__(self, out, y, inprob=1, lsmall = None, insmall = None):
-        outlens, outin = out.split([3,3],1)
-        ylens, yin = y.split([3,3],1)
-        lensdice = dice_circle_loss(outlens, ylens, epsilon=self.epsilon, size_average=self.size_average,
+    def __call__(self, out, y, inprob=1, switch=None, lsmall = None, insmall = None):
+        outlens = out[:,:3]
+        if switch is not None:
+            outin = torch.empty_like(outlens)
+            for n in range(out.size(0)):
+                if switch[n]:
+                    outin[n] = out[n,3:6]
+                else:
+                    outin[n] = out[n,6:9]
+        else:
+            outin = out[:,3:6]
+            
+        lensdice = dice_circle_loss(outlens, y[:,0:3], epsilon=self.epsilon, size_average=self.size_average,
                                     reduce=self.reduce, missloss=self.missloss, addloss = lsmall, cropbox=self.cropbox)
-        indice = dice_circle_loss(outin, yin, epsilon=self.epsilon, size_average=self.size_average,
+        if torch.isnan(lensdice):
+            print("nan lensdice")
+            print(outlens)
+            print(y[:,0:3])
+            quit()
+        indice = dice_circle_loss(outin, y[:,3:6], epsilon=self.epsilon, size_average=self.size_average,
                                   reduce=self.reduce, missloss=self.missloss, addloss = insmall, cropbox=self.cropbox)
+                                  
+        if torch.isnan(indice):
+            print("nan indice")
+            print(outin)
+            print(y[:,3:6])
+            quit()
+            
+        if y.size(1)>6:
+            indice = indice + dice_circle_loss(out[:,6:9], y[:,6:9], epsilon=self.epsilon, size_average=self.size_average,
+                                               reduce=self.reduce, missloss=self.missloss, addloss = insmall, cropbox=self.cropbox)
+            if torch.isnan(indice):
+                print("nan indice")
+                print(out[:,6:9])
+                print(y[:,6:9])
+                quit()
         return lensdice+indice
 
 def algproc(y):
@@ -270,8 +317,11 @@ def circdraw(lens_data, inner_data, width=1920, height=1080, thickness=2, style=
         style.append(style[0])
     (lx, ly, lr) = lens_data
     (ix, iy, ir) = inner_data
+    if ir==0:
+        ix,iy = -1,-1
     lines = []
-
+    lr = abs(lr)
+    ir = abs(ir)
     for y in range(height):
         leftlenout = width if (y-ly)**2>(lr+thickness)**2 else math.floor(lx-(math.sqrt((lr+thickness)**2-(y-ly)**2)))
         rightlenout = width if (y-ly)**2>(lr+thickness)**2 else math.floor(lx+(math.sqrt((lr+thickness)**2-(y-ly)**2)))
@@ -293,6 +343,10 @@ def circdraw(lens_data, inner_data, width=1920, height=1080, thickness=2, style=
                         + [style[2]]*(leftinin-leftinout) + [style[4]]*(rightinin-leftinin)
                         + [style[2]]*(rightinout-rightinin) + [style[3]]*(rightlenin-rightinout)
                         + [style[1]]*(rightlenout-rightlenin) + [style[0]]*(width-rightlenout))
+        if(len(lines[-1])>width):
+            print(lx,ly,lr,ix,iy,ir)
+            print(y)
+            print(leftlenout, leftlenin,leftinout,leftinin,rightinin,rightinout,rightlenin,rightlenout,width)
     if not classes:
         return lines
     present = torch.zeros(max(style)+1, dtype=torch.float)
@@ -333,13 +387,13 @@ def getannotations(circle_file):
     return annotations
 
 class ToPil():
-    def __call__(self,  image, lens_data = None, inner_data = None):
+    def __call__(self,  image, lens_data = None, inner_data = None, *a):
         if lens_data is None:
-            image, lens_data, inner_data = image
-        return F.to_pil_image(image), lens_data, inner_data
+            image, lens_data, inner_data, *a = image
+        return (F.to_pil_image(image), lens_data, inner_data, *a)
 
 class ToTens():
-    def __call__(self,  image, lens_data = None, inner_data = None):
+    def __call__(self,  image, lens_data = None, inner_data = None, *a):
         if lens_data is None:
             image, lens_data, inner_data, *a = image
         return (F.to_tensor(image), lens_data, inner_data, *a)
@@ -360,33 +414,47 @@ class RandomResizedCropP():
         If tame='sides' will only do this for x coordinate
         Will always at least make sure that the frame contains the center of the eye
     '''
-    def __init__(self, width, height, scale, maxscale=None, tame = 'yes'):
+    def __init__(self, width, height, scale, maxscale=None, tame = 'yes', circle_fullness=1, transform_line=False):
         self.finwidth = width
         self.finheight = height
         self.minscale = scale
         self.maxscale = maxscale
         self.tame = tame
-    def __call__(self, image, lens_data = None, inner_data = None):
+        self.fullness = circle_fullness
+        self.transform_line = transform_line
+    def __call__(self, image, lens_data = None, inner_data = None, *i2):
         if lens_data is None:
-            image, lens_data, inner_data = image
+            image, lens_data, inner_data, *i2 = image
+        if self.transform_line:
+            line_dat = i2[-1]
+            i2 = i2[:-1]
+            lang,ox,oy = line_dat # Trying midline segmentation
         (width, height) = image.size
         (lx, ly, lr) = lens_data
         (ix, iy, ir) = inner_data
         if self.maxscale is None:
             scale = self.minscale
         else:
-            scale = np.random.random_sample() * (self.maxscale-self.minscale)+self.minscale
+            if self.tame:
+                maxscale = min(self.maxscale,min(self.finheight,self.finwidth)/(2*lr*self.fullness+1))
+                minscale = self.minscale
+                if maxscale<minscale:
+                    minscale = maxscale
+                    warnings.warn('Had to reduce minimum scale to fit circle')
+            else:
+                maxscale, minscale = self.maxscale, self.minscale
+            scale = np.random.random_sample() * (maxscale-minscale)+minscale
         cropwidth = self.finwidth/scale
         cropheight  = self.finheight/scale
         if (self.tame == 'yes' or self.tame == 'sides'):
-            minx = max(0, lx+lr-cropwidth)
-            maxx = min(width-cropwidth, lx-lr) + 1
+            minx = max(0, lx+self.fullness*lr-cropwidth)
+            maxx = min(width-cropwidth, lx-self.fullness*lr) + 1
         else:
             minx = max(0, lx-cropwidth)
             maxx = min(width-cropwidth, lx) + 1
         if(self.tame == 'yes'):
-            miny = max(0, ly+lr-cropheight)
-            maxy = min(height-cropheight, ly-lr) + 1
+            miny = max(0, ly+self.fullness*lr-cropheight)
+            maxy = min(height-cropheight, ly-self.fullness*lr) + 1
         else:
             miny = max(0, ly-cropheight)
             maxy = min(height-cropheight, ly) + 1
@@ -397,15 +465,25 @@ class RandomResizedCropP():
             print(inner_data)
             print(width, height)
             print(scale, cropwidth, cropheight)
+            print(self.circle_fullness)
         x = np.random.randint(minx, maxx)
         y = np.random.randint(miny, maxy)
         lx, ly, lr = scale*(lx-x),scale*(ly-y),scale*lr
+        
         if(ir>0):
             ix, iy, ir = scale*(ix-x),scale*(iy-y),scale*ir
-        return F.resized_crop(image,y,x,cropheight,cropwidth,(self.finheight,self.finwidth)), (lx,ly,lr), (ix,iy,ir)
+        extrarets = []
+        if i2:
+            (ix2, iy2, ir2) = i2[0]
+            if ir2>0:
+                ix2, iy2, ir2 = scale*(ix2-x),scale*(iy2-y),scale*ir2
+            extrarets.append((ix2,iy2,ir2))
+        if self.transform_line:
+            extrarets.append((lang, scale*(ox-x), scale*(oy-y)))
+        return (F.resized_crop(image,y,x,cropheight,cropwidth,(self.finheight,self.finwidth)), (lx,ly,lr), (ix,iy,ir), *extrarets)
         
 class CropP():
-    def __init__(self, minx, miny, maxx = None, maxy = None, width = None, height = None):
+    def __init__(self, minx, miny, maxx = None, maxy = None, width = None, height = None, transform_line=False):
         if(maxx is None and width is None):
             raise ValueError("Need a maxx or width argument")
         if(maxy is None and height is None):
@@ -420,15 +498,26 @@ class CropP():
             self.height = maxy-miny
         else:
             self.height = height
-    def __call__(self, image, lens_data = None, inner_data = None):
+        self.transform_line = transform_line
+    def __call__(self, image, lens_data = None, inner_data = None, *i2):
         if lens_data is None:
-            image, lens_data, inner_data = image
+            image, lens_data, inner_data, *i2 = image
+        if self.transform_line:
+            line_dat = i2[-1]
+            i2 = i2[:-1]
         (lx, ly, lr) = lens_data
         (ix, iy, ir) = inner_data
-        return F.crop(image,self.miny,self.minx,self.height,self.width), (lx-self.minx,ly-self.miny,lr), (ix-self.minx,iy-self.miny,ir)
+        extrarets = []
+        if i2:
+            (ix2, iy2, ir2) = i2[0]
+            extrarets.append((ix2-self.minx,iy2-self.miny,ir))
+        if self.transform_line:
+            lang,ox,oy = line_dat # Trying midline segmentation
+            extrarets.append((lang,ox-self.minx,oy-self.miny))
+        return (F.crop(image,self.miny,self.minx,self.height,self.width), (lx-self.minx,ly-self.miny,lr), (ix-self.minx,iy-self.miny,ir), *extrarets)
 
 class RandRotateP():
-    def __init__(self, angle = 15, maxangle = None, resizing = False):
+    def __init__(self, angle = 15, maxangle = None, resizing = False, transform_line=False):
         '''
             The resizing attribute for this and Rotate controls whether the image will resize to keep the whole
             lens in the picture; it's only neccessary to ensure tame cropping
@@ -439,26 +528,43 @@ class RandRotateP():
         self.min = angle
         self.max = maxangle
         self.resizing = resizing
-    def __call__(self, image, lens_data = None, inner_data = None):
+        self.transform_line = transform_line
+    def __call__(self, image, lens_data = None, inner_data = None, *i2):
         angle = np.random.random_sample() * (self.max-self.min)+self.min
-        return rotateP(image, lens_data, inner_data, angle, self.resizing)
+        return rotateP(image, lens_data, inner_data, *i2, angle=angle, resizing=self.resizing, transform_line=self.transform_line)
         
 class ResizeP():
-    def __init__(self, dim):
+    def __init__(self, dim, transform_line=False):
         self.dim=dim
-    def __call__(self, image, lens_data = None, inner_data = None):
+        self.transform_line = transform_line
+    def __call__(self, image, lens_data = None, inner_data = None, *i2):
         if lens_data is None:
-            image, lens_data, inner_data = image
+            image, lens_data, inner_data, *i2 = image
+        if self.transform_line:
+            line_dat = i2[-1]
+            i2 = i2[:-1]
         (w,h) = image.size
-        scale = self.dim/min(w,h)
+        if isinstance(self.dim, tuple):
+            scale = max(self.dim)/min(w,h)
+        else:
+            scale = self.dim/min(w,h)
         (lx, ly, lr) = lens_data
         (lx, ly, lr) = scale*lx, scale*ly, scale*lr
         (ix, iy, ir) = inner_data
         (ix, iy, ir) = scale*ix, scale*iy, scale*ir
-        return F.resize(image, self.dim), (lx, ly, lr), (ix, iy, ir)
+        extrarets = []
+        if i2:
+            (ix2, iy2, ir2) = i2[0]
+            extrarets.append((scale*ix2, scale*iy2, scale*ir2))
+        if self.transform_line:
+            lang,ox,oy = line_dat # Trying midline segmentation
+            extrarets.append((lang,scale*ox,scale*oy))
+        return (F.resize(image, self.dim), (lx, ly, lr), (ix, iy, ir), *extrarets)
+        #return F.resize(image, self.dim), (lx, ly, lr), (ix, iy, ir), (lang,ox,oy) # Trying midline segmentation
         
 class FlipP():
     def __call__(self, image, lens_data = None, inner_data = None):
+        # Largely inappropriate for Goldmann so I won't add Goldmann-specific stuff
         if lens_data is None:
             image, lens_data, inner_data = image
         (lx,ly,lr) = lens_data
@@ -469,12 +575,16 @@ class FlipP():
         return F.hflip(image), (w-lx, ly, lr), (ix, iy, ir)
         
 class PadP():
-    def __init__(self, x, y):
+    def __init__(self, x, y, transform_line=False):
         self.x = x
         self.y = y
-    def __call__(self, image, lens_data = None, inner_data = None):
+        self.transform_line = transform_line
+    def __call__(self, image, lens_data = None, inner_data = None, *i2):
         if lens_data is None:
-            image, lens_data, inner_data = image
+            image, lens_data, inner_data, *i2 = image
+        if self.transform_line:
+            line_dat = i2[-1]
+            i2 = i2[:-1]
         (lx, ly, lr) = lens_data
         lens_data = (lx+self.x,ly+self.y,lr)
         (ix, iy, ir) = inner_data
@@ -483,11 +593,22 @@ class PadP():
         im_arr = np.asarray(image)
         im_arr = np.pad(im_arr, ((self.y, self.y), (self.x, self.x), (0,0)), 'edge')
         image = PIL.Image.fromarray(im_arr)
-        return image, lens_data, inner_data
+        extrarets = []
+        if i2:
+            (ix2, iy2, ir2) = i2[0]
+            extrarets.append((ix2+self.x,iy2+self.y,ir))
+        if self.transform_line:
+            lang,ox,oy = line_dat # Trying midline segmentation
+            extrarets.append((lang,ox+self.x,oy+self.y))
+        return (image, lens_data, inner_data, *extrarets)
         
-def rotateP(image, lens_data = None, inner_data = None, angle=0, resizing=False):
+def rotateP(image, lens_data = None, inner_data = None, *i2, angle=0, resizing=False, transform_line=False):
     if lens_data is None:
-        image, lens_data, inner_data = image
+        image, lens_data, inner_data, *i2 = image
+    if transform_line:
+        line_dat = i2[-1]
+        i2 = i2[:-1]
+        lang,ox,oy = line_dat
     (lx, ly, lr) = lens_data
     (ix, iy, ir) = inner_data
     (w,h) = image.size
@@ -497,6 +618,11 @@ def rotateP(image, lens_data = None, inner_data = None, angle=0, resizing=False)
     [lx, ly] = np.matmul(rotmat, (np.array([lx, ly])-center))+center
     if (ir != 0):
         [ix, iy] = np.matmul(rotmat, (np.array([ix, iy])-center))+center
+    if i2:
+        (ix2, iy2, ir2) = i2[0]
+        [ix2, iy2] = np.matmul(rotmat, (np.array([ix2, iy2])-center))+center
+    if transform_line:
+        [ox,oy] =  np.matmul(rotmat, (np.array([ox, oy])-center))+center
     if resizing: # reason one we need to expand the image: the circle gets rotated out of frame
         toppad = max(0,math.ceil(-ly+lr))
         botpad = max(0,math.ceil(ly+lr-h))
@@ -507,6 +633,12 @@ def rotateP(image, lens_data = None, inner_data = None, angle=0, resizing=False)
         if(ir != 0):
             ix += leftpad
             iy += toppad
+        if i2 and ir2 != 0:
+            ix2 += leftpad
+            iy2 += toppad
+        if transform_line:
+            ox += leftpad # Trying midline segmentation
+            oy += toppad # Trying midline segmentation
     else:
         toppad, botpad, leftpad, rightpad = 0,0,0,0
     # reason two we need to expand the image: so we don't get a black background after rotating
@@ -518,7 +650,14 @@ def rotateP(image, lens_data = None, inner_data = None, angle=0, resizing=False)
     padim = PIL.Image.fromarray(im_arr)
     padim = F.rotate(padim, angle)
     image = F.crop(padim, pt-toppad, pl-leftpad, h+toppad+botpad, w+leftpad+rightpad)
-    return image, (lx, ly, lr), (ix, iy, ir)
+    extrarets = []
+    if i2:
+        (ix2, iy2, ir2) = i2[0]
+        extrarets.append((ix2,iy2,ir))
+    if transform_line:
+        lang,ox,oy = line_dat # Trying midline segmentation
+        extrarets.append((lang-arad,ox,oy))
+    return (image, (lx, ly, lr), (ix, iy, ir), *extrarets)
 
 class FourCuts():
     def __init__(self, xrange=0, yrange=0):
@@ -835,10 +974,10 @@ def splitset(img_dir, circle_file, train_prop = 0.8, shuffle = False, seed = Non
         #val_trans = transforms.Compose([Crop(320,0,1600,1080), Rescale(0.2)])
         scalings = [transforms.Compose([PadP(320, 270), RandomResizedCropP(256, 216, 0.134, 0.2)]),
                     RandomResizedCropP(256, 216, 0.2)]
-        train_trans = transforms.Compose([HistEq(), ToPil(), RandRotateP(15, resizing=True),
+        train_trans = transforms.Compose([ToPil(), RandRotateP(15, resizing=True),
                                           transforms.RandomChoice(scalings), ToTens()])
                                           #transforms.RandomChoice(scalings), transforms.RandomApply([FlipP()]), ToTens()])
-        val_trans = transforms.Compose([HistEq(), ToPil(), CropP(320,0,1600,1080), ResizeP(216), ToTens()])
+        val_trans = transforms.Compose([ToPil(), CropP(320,0,1600,1080), ResizeP(216), ToTens()])
     else:
         train_trans = transforms.Compose([RandRescale(.25,.3), RandRotate(15), RandomCrop(256, 256, tame)])
         val_trans = transforms.Compose([Crop(448,28,1472,1052), Rescale(0.25)])
@@ -886,12 +1025,17 @@ class Inner_Dataset(Dataset): # Only has inner data
         return k[:-4], image, out, torch.cat((torch.ones(1), out_cls),0)
         
 class Im_Dataset(Dataset): # Images only; no checking
-    def __init__(self, img_dir, check_on, transform = None):
+    def __init__(self, img_dir, check_on, transform = None, crop=True):
         self.img_dir = img_dir
-        self.filelist = [x for x in os.listdir(img_dir) if ('iP0'+check_on) in x]
-        self.filelist.sort(key=lambda x:int(x[14:-4]))
-        if transform is None:
-            transform = transforms.Compose([Crop(320,0,1600,1080), Rescale(0.2)])
+        if check_on is not None:
+            self.filelist = [x for x in os.listdir(img_dir) if ('iP0'+check_on) in x]
+            self.filelist.sort(key=lambda x:int(x[14:-4]))
+        else:
+            self.filelist = os.listdir(img_dir)
+        if transform is None and crop:
+            transform = transforms.Compose([ToPil(), CropP(320,0,1600,1080), ResizeP((216, 256)), ToTens()])
+        elif transform is None:
+            transform = transforms.Compose([ToPil(), ResizeP((216, 256)), ToTens()])
         self.transform = transform
         
     def __len__(self):
@@ -902,9 +1046,7 @@ class Im_Dataset(Dataset): # Images only; no checking
         k = self.filelist[idx]
         img_name = os.path.join(self.img_dir, k)
         im_array = io.imread(img_name)
-        if self.transform is not None:
-            im_array, _, _ = self.transform((im_array, [960,540,0], [0,0,0]))
-        image = torch.tensor(im_array.transpose(2,0,1), dtype=torch.float)
+        image, _, _ = self.transform((im_array, [960,540,0], [0,0,0]))
 
         #print(image.shape, out.shape)
         return k, image
@@ -1059,85 +1201,7 @@ class Dual_Dataset(Dataset):
         outdat = torch.tensor(lens_data + inner_data)
         return k, image, outim, outdat, out_cls
 
-  
-'''  
-fourcc = cv2.VideoWriter_fourcc(*'XVID')
-out = cv2.VideoWriter('output.avi', fourcc, 30, (1920, 1080))
-for x in range(160, 1761, 20):
-    set1 = [[28,26,228], [184, 126, 55], [74,175,77]]
-    ar = np.array(circfill([960, 540, 500], [x, 540, 300], style = set1, classes = False))
-    out.write(np.array(ar).astype(np.dtype('uint8')))
-    
-out.release()
-cv2.destroyAllWindows()
-'''
-    
-      
-'''
-f = open('trainstuff.txt')
-results = {}
-for x in ['squeezenet', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']:
-    curves = {'train':[], 'validate':[]}
-    for n in range(20):
-        curves['train'].append(float(f.readline()[:7]))
-        curves['validate'].append(float(f.readline()[:7]))
-    results[x] = curves
-f.close()
+default_corner_trans = transforms.Compose([ToPil(), CornerResize(256, 216, 0.4), ToTens()])
 
-f = open('results')
-res2 = json.load(f)
-f.close()
-
-for x in ['squeezenet', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']:
-    for y in ['train', 'validate']:
-        results[x][y].extend(res2[x][y])
-
-
-for x in ['squeezenet', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']:
-    fig, ax = plt.subplots()
-    
-    ax.plot(results[x]['train'], label='Training')
-    ax.plot(results[x]['validate'], label='Validation')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Loss (categorical cross-entropy)')
-    ax.legend()
-    fig.savefig(x+'learn.png')
-    ax.set_yscale('log')
-    fig.savefig(x+'learnlog.png')
-    plt.close(fig)
-    
-print(results['resnet50']['validate'])
-    
-fig, ax = plt.subplots()
-
-for x in ['squeezenet', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']:
-    ax.plot(results[x]['validate'], label=x)
-ax.set_xlabel('Epoch')
-ax.set_ylabel('Loss (categorical cross-entropy)')
-ax.legend()
-fig.savefig('compare.png')
-ax.set_yscale('log')
-fig.savefig('comparelog.png')
-plt.close(fig)
-'''
-
-'''
-f = open('numtrain.txt')
-curves = {'train':[], 'validate':[]}
-for n in range(40):
-    curves['train'].append(float(f.readline()[:7]))
-    curves['validate'].append(float(f.readline()[:7]))
-f.close()
-
-fig, ax = plt.subplots()
-    
-ax.plot(curves['train'], label='Training')
-ax.plot(curves['validate'], label='Validation')
-ax.set_xlabel('Epoch')
-ax.set_ylabel('Loss (L1)')
-ax.legend()
-fig.savefig('learnnums.png')
-ax.set_yscale('log')
-fig.savefig('learnnumslog.png')
-plt.close(fig)
-'''
+if __name__ == '__main__':
+    pass

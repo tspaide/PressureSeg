@@ -37,6 +37,7 @@ from pspnet import PSPNet, PSPCircs
 plt.switch_backend('agg')
 
 CIRCLE_DATA_PATH = 'goldmann_measurements.json'
+TWO_CIRCLE_DATA_PATH = 'goldmann_measurements_2.json'
 IMAGE_BASE_PATH = '../../yue/joanne/GAT SL videos'
 HOLDOUT_SET = ['40-J34-OS','10-J49-OD','21-J48-OS','11-F35-OS','55-F18-OD','19-F55-OD']
 GOLDMANN_OUTER_DIAM = 7
@@ -46,7 +47,7 @@ models = {
     'densenet': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet', w=w, h=h),
     'resnet18': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18', w=w, h=h),
     'resnet34': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34', w=w, h=h),
-    'resnet50': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50', w=w, h=h, extraend=True,out_nums=9),
+    'resnet50': lambda h, w, **kwargs: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50', w=w, h=h, extraend=True,out_nums=9,**kwargs),
     'resnet101': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101', w=w, h=h),
     'resnet152': lambda h, w: PSPCircs(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152', w=w, h=h)
 }
@@ -109,12 +110,15 @@ def get_golddat(coord_dict):
         return im,coords
     return lookup
     
-def im_only(key):
-    return io.imread(key), [1,1,1,1,1,1,1]
-    #return io.imread(key), [1,1,1,1,1,1,1,1,1,1] # Trying midline segmentation
-        
-def fakesonly(key):
-    return goldsketch.goldmann_fake()
+def im_only(num_entries=7):
+    def lookup(key):
+        return io.imread(key), [1]*num_entries
+    return lookup
+
+def fakesonly(both_mires=True, color_mode='rand', extrarate=0.5):
+    def lookup(key):
+        return goldsketch.goldmann_fake(bothmires=both_mires,color_mode=color_mode,extra=(np.random.rand()<extrarate))
+    return lookup
     
 def lookup_switch(test, lookup_a, lookup_b):
     def lookup(key):
@@ -151,9 +155,10 @@ def cat_ims(readers):
         return np.concatenate([r(key) for r in readers], axis=2)
     return finread
     
-def saveorig(info, in_arr, out_arr, name='orig'):
-    info[name] = arrToTens(in_arr)
-    return in_arr, out_arr
+def saveorig(info, dat, name='orig'):
+    im, *a = dat
+    info[name] = im
+    return dat
     
 def fixedcrop(info, in_arr, out_arr, l=None, r=None, t=None, b=None):
     logging.info(f'Cropping with dimensions [{t}:{b},{l}:{r}]')
@@ -191,11 +196,47 @@ def flip():
 def pad(x,y):
     return constinfo(getdata.PadP(x,y))
     
-def package_goldcoords(info, dat):
-    im, coords = dat
-    info['isbot']=int(coords[6])
-    return im,coords[:3],coords[3:6]
-    #return im,coords[:3],coords[3:6],coords[7:10] if len(coords)>7 else [1.,1.,1.] # Trying midline segmentation
+def normalize(targetmin=0, targetmax=1):
+    def trans(info, dat):
+        logging.info('Normalizing image')
+        im, *a = dat
+        cmins,_ = torch.min(torch.min(im,2,keepdim=True)[0],1,keepdim=True)
+        cmaxs,_ = torch.max(torch.max(im,2,keepdim=True)[0],1,keepdim=True)
+        im = (targetmax-targetmin)*(im-cmins)/(cmaxs-cmins)+targetmin
+        return (im, *a)
+    return trans
+    
+def package_goldcoords(transform_line=False,expected_coord_len=10):
+    def t(info, dat):
+        im, coords = dat
+        if transform_line:
+            if len(coords)>expected_coord_len:
+                line_coords = coords[-3:]
+                coords = coords[:-3]
+            else:
+                line_coords = [1.,1.,1.]
+            extraret = [line_coords]
+        else:
+            extraret = []
+        if len(coords)==7:
+            info['isbot']=int(coords[6])
+            return (im,coords[:3],coords[3:6],*extraret)
+        else:
+            info['origseg']=int(coords[9])
+            return (im,coords[:3],coords[3:6],coords[6:9],*extraret)
+    return t
+    
+def add_classes():
+    def t(info, dat):
+        im, lens_data, inner_data, *i2 = dat
+        if 'origseg' in info:
+            innerrad = i2[0][2] if info['origseg'] else inner_data[2]
+        else:
+            innerrad = inner_data[2]
+        classes = np.array((1,1,int(innerrad!=0)),dtype=np.float32)
+        return im, np.concatenate([lens_data, inner_data,*i2]).astype(np.float32), classes
+        #return im, np.concatenate([lens_data, inner_data, line_dat]).astype(np.float32), classes # Trying midline segmentation
+    return t
     
 def composetransforms(transforms):
     def fintrans(info, dat):
@@ -231,13 +272,9 @@ class ImtoNumsDataset(Dataset):
         dat = self.datlookup(key)
         info = self.infobase.copy()
         info['key']=key
-        im, coords = dat
         dat = self.transformer(info, dat)
-        im, lens_data, inner_data = dat
-        #im, lens_data, inner_data, line_dat = dat # Trying midline segmentation
-        classes = np.array((1,1,int(inner_data[2]!=0)),dtype=np.float32)
-        return info, im, np.concatenate([lens_data, inner_data]).astype(np.float32), classes
-        #return info, im, np.concatenate([lens_data, inner_data, line_dat]).astype(np.float32), classes # Trying midline segmentation
+        im, coords, classes = dat
+        return info, im, coords, classes
     
 def maken(cl, num_to_make=2, multinumbering=True, **kwargs):
     if multinumbering and num_to_make>10:
@@ -281,37 +318,55 @@ def infiniloader(dataset, **kwargs):
                 break
     del loader
 
-def dividefolds(pic_shuffle=True, seed=None, valprop=0.2, num_out=3):
+def dividefolds(pic_shuffle=True, seed=None, valprop=0.2, num_out=3, dataloc=CIRCLE_DATA_PATH, imitate_single=True, readd_extra=False):
     if seed:
         pic_shuffle=True
+    if dataloc==CIRCLE_DATA_PATH:
+        imitate_single = False
+    if imitate_single:
+        trainkeys,valkeys,outkeys = dividefolds(pic_shuffle, seed, valprop, num_out)
+        trainfolds = set(b for (a,b,c) in trainkeys)
+        valfolds = set(b for (a,b,c) in valkeys)
+        outfolds = set(b for (a,b,c) in outkeys)
+        added_video=[]
     vids = []
-    with open(CIRCLE_DATA_PATH) as f:
+    with open(dataloc) as f:
         circle_data = json.load(f)
     for foldname in circle_data:
         for subfold in circle_data[foldname]:
             if subfold[:-4] in HOLDOUT_SET:
                 continue
+            if imitate_single and subfold == '27-J33-OD.csv': # Magic string, sorta
+                added_video = [(foldname,subfold,x) for x in circle_data[foldname][subfold]]
+                continue
             vids.append([(foldname,subfold,x) for x in circle_data[foldname][subfold]])
     
-    r = np.random.RandomState(seed)
-    validxs = r.choice(len(vids), size=int(len(vids)*valprop), replace=False)
-    isval = np.zeros(len(vids), dtype=np.bool)
-    for n in validxs:
-        isval[n]=1
-        
-    valfolds = [v for n,v in enumerate(vids) if isval[n]]
-    testfolds = [v for n,v in enumerate(vids) if not isval[n]]
-    r.shuffle(valfolds)
-    if type(num_out) is slice:
-        outfolds = valfolds[num_out]
+    if imitate_single:
+        trainfolds = [vid for vid in vids if vid[0][1] in trainfolds]
+        valfolds = [vid for vid in vids if vid[0][1] in valfolds]
+        outfolds = [vid for vid in vids if vid[0][1] in outfolds]
+        if readd_extra:
+            trainfolds.append(added_video)
     else:
-        outfolds = valfolds[:num_out]
+        r = np.random.RandomState(seed)
+        validxs = r.choice(len(vids), size=int(len(vids)*valprop), replace=False)
+        isval = np.zeros(len(vids), dtype=np.bool)
+        for n in validxs:
+            isval[n]=1
+            
+        valfolds = [v for n,v in enumerate(vids) if isval[n]]
+        trainfolds = [v for n,v in enumerate(vids) if not isval[n]]
+        r.shuffle(valfolds)
+        if type(num_out) is slice:
+            outfolds = valfolds[num_out]
+        else:
+            outfolds = valfolds[:num_out]
 
-    testkeys = [k for f in testfolds for k in f]
+    trainkeys = [k for f in trainfolds for k in f]
     valkeys = [k for f in valfolds for k in f]
     outkeys = [k for f in outfolds for k in f]
     
-    return testkeys,valkeys,outkeys
+    return trainkeys,valkeys,outkeys
     
 def csvout(val_path, training_curve, epoch_losses, datsize):
     with open(os.path.join(val_path,'Training curve.csv'), 'w') as f:
@@ -323,7 +378,11 @@ def csvout(val_path, training_curve, epoch_losses, datsize):
             
 def smoothed_tc(outloc, training_curve, alpha=0.999):
     tclen = min(len(training_curve['train']),len(training_curve['validate']))
+    if 'two_mire' in training_curve:
+        tclen = min(len(training_curve['two_mire']), tclen)
     jointtc = np.array([training_curve['train'][:tclen],training_curve['validate'][:tclen]])
+    if 'two_mire' in training_curve:
+        jointtc = np.concatenate((jointtc, np.array([training_curve['two_mire'][:tclen]])))
     tcmeans = np.empty_like(jointtc)
     curr = np.zeros_like(jointtc[...,0])
     ct = 0
@@ -333,10 +392,14 @@ def smoothed_tc(outloc, training_curve, alpha=0.999):
     fig, ax = plt.subplots()
     ax.plot(tcmeans[0,tclen//2:])
     ax.plot(tcmeans[1,tclen//2:])
+    if 'two_mire' in training_curve:
+        ax.plot(tcmeans[2,tclen//2:])
     ymin, ymax = ax.get_ylim()
     ax.clear()
     ax.plot(tcmeans[0], linewidth=0.5, label='Training')
     ax.plot(tcmeans[1], linewidth=0.5, label='Validation')
+    if 'two_mire' in training_curve:
+        ax.plot(tcmeans[2], linewidth=0.5, label='Two-Mire Validation')
     ax.set_ylim(ymin,ymax)
     ax.legend()
         
@@ -373,21 +436,179 @@ def testbatch(suffixes, setlocs=None, nettypes='UNet', cudae=range(4)):
   
 def setseed(worker_id):
     np.random.seed(torch.initial_seed()&((1<<32)-1))
-  
+
+def framereader(video_path, dispname, requested_info=[]):
+    transform = composetransforms([constinfo(getdata.ToPil()), constCrop(177,673,945,1441),
+                                   resize(256), constinfo(getdata.ToTens())])
+    cap = cv2.VideoCapture(video_path)
+    for n in requested_info:
+        yield cap.get(n)
+    ret, inframe = cap.read()
+    framenum = 0
+    while(ret):
+        name = ' '.join([dispname, 'frame', str(framenum)])
+        inframe = inframe.transpose(1,0,2)
+        inframe = np.flip(np.flip(inframe,2),1).copy()
+        x, _, _ = transform({},(inframe, [960,540,0], [0,0,0]))
+        x = torch.unsqueeze(x,0)
+        yield name, x
+        ret, inframe = cap.read()
+        framenum +=1
+    
+def _sqtol(r2, rad, tolerance):
+    return (r2<(rad+tolerance)**2)&(r2>max(rad-tolerance,0)**2)
+    
+def movwrite(net, val_on=None, data_path=None, save_path=None, video_path=None, dispname=None, thickness=1.5):
+    set1 = np.array([[28,26,228], [184,126,55], [74,175,77], [163,78,152]],dtype=np.uint8)
+    if (val_on is not None) and (data_path is not None):
+        frames = [os.path.join(data_path,fname) for fname in os.listdir(data_path) if val_on in fname and '.png' in fname]
+        frames.sort()
+        transform = composetransforms([package_goldcoords, constinfo(getdata.ToPil()), constCrop(177,673,945,1441),
+                                       resize(256), constinfo(getdata.ToTens())])
+        dat = ImtoNumsDataset(frames,im_only,transformer=transform)
+        if(len(dat)==0):
+            return None
+        dat_loader = DataLoader(dat)
+        dat_iterator = tqdm(dat_loader)
+        framerate = 25
+    elif video_path is not None:
+        if dispname is None:
+            _,dispname = os.path.split(video_path)
+        dat_iterator = framereader(video_path, dispname, [5,7])
+        framerate = next(dat_iterator)
+        num_frames = next(dat_iterator)
+        dat_iterator = tqdm(dat_iterator, total=int(num_frames))
+    else:
+        raise ValueError('movwrite needs either a val_on and data_path argument (for frame input) or '
+                         'video_path argument (for video input)')
+    if(save_path is not None):
+        dat_iterator.set_description(save_path)
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    vid = cv2.VideoWriter('.'.join([save_path,'avi']), fourcc, framerate, (808, 296))
+    pressures = []
+    results = []
+    net.eval()
+    torch.set_grad_enabled(False)
+    yy,xx = np.mgrid[0:256,0:256]
+    yy2,xx2 = yy**2,xx**2
+    for name, x in dat_iterator:
+        xa = x.cuda()
+        out, out_cls = net(xa)
+        outc = out.detach().cpu()[0]
+        outc = torch.abs(outc).numpy()
+        im_arr = np.clip((x[0]*256).numpy(),0,255).astype('uint8')
+        im_arr = np.flip(im_arr,0).transpose(1,2,0)
+        lr = outc[2]
+        outr2 = xx2-2*outc[0]*xx+outc[0]**2+yy2-2*outc[1]*yy+outc[1]**2
+        if(out_cls[0,2]>0):
+            rightr2 = xx2-2*outc[3]*xx+outc[3]**2+yy2-2*outc[4]*yy+outc[4]**2
+            leftr2 = xx2-2*outc[6]*xx+outc[6]**2+yy2-2*outc[7]*yy+outc[7]**2
+            ir_r = outc[5]
+            ir_l = outc[8]
+            ir = ir_r if (outc[0]-outc[3])**2+(outc[1]-outc[4])**2<(outc[0]-outc[6])**2+(outc[1]-outc[7])**2 else ir_l
+        else:
+            rightr2 = np.full_like(outr2,255)
+            leftr2 = rightr2
+            ir_r = 0
+            ir_l = ir_r
+            ir = ir_r
+        circmask = (outr2<outc[2]**2)*(1+(rightr2<ir_r**2)+(leftr2<ir_l**2))
+        out_arr = set1[circmask]
+        overlay = _sqtol(outr2,outc[2],thickness)|_sqtol(rightr2,ir_r,thickness)|_sqtol(leftr2,ir_l,thickness)
+        circover = overlay[:,:,np.newaxis]*np.array([255,255,255],dtype=np.uint8)
+        frame = np.full((296, 808, 3), 255, np.dtype('uint8'))
+        frame[10:266, 10:266] = im_arr
+        frame[10:266, 276:532] = out_arr
+        frame[10:266, 542:798] = cv2.max(im_arr, circover)
+        cv2.putText(frame, name, (246, 288), 0, 0.8, (0,0,0))
+        vid.write(frame)
+        
+        diam = abs(ir/lr)*GOLDMANN_OUTER_DIAM
+        iop = 168.694/diam**2 if diam>0 else 0
+        pressures.append(iop)
+        results.append(outc.tolist())
+    torch.set_grad_enabled(True)
+    
+    ndpressures = np.array(pressures)
+    fnums = np.mgrid[0:ndpressures.size][ndpressures>0]
+    fig, ax = plt.subplots()
+    tlim = np.percentile(ndpressures[ndpressures>0],75)*1.5
+    ax.plot(fnums,ndpressures[ndpressures>0],'bo')
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('Pressure (mm Hg)')
+    ax.set_ylim(0,tlim)
+    fig.savefig('.'.join([save_path,'png']))
+    plt.close(fig)
+    vid.release()
+    cv2.destroyAllWindows()
+    return pressures, results
+    
+def process_videos(netloc,vidlist,savelocs=None,dispnames=None):
+    if not 'tests' in netloc:
+        netloc = os.path.join('tests',netloc)
+    if not 'UNet' in netloc: # TODO: fix net name
+        netloc = os.path.join(netloc,'UNet_best') # Ditto
+    model_state = load(netloc)
+    net = models['resnet50'](32,32)
+    net = nn.DataParallel(net)
+    net = net.cuda()
+    net.load_state_dict(model_state['model'])
+    
+    if savelocs is None:
+        netdir,_ = os.path.split(netloc)
+        savelocs = (os.path.join(netdir,vidname.split('.')[0]) for _,vidname in (os.path.split(vidloc) for vidloc in vidlist))
+    if dispnames is None:
+        dispnames = (None for _ in vidlist)
+    pressureses = {}
+    resultses = {}
+    for video_path, save_path, dispname in zip(vidlist,savelocs,dispnames):
+        p,r = movwrite(net, video_path=video_path, save_path=save_path, dispname=dispname)
+        pressureses[video_path] = p
+        resultses[video_path] = r
+    return pressureses, resultses
+    
 def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=False, loadloc=None, saveevery=None, start_epoch=0):
-    trainkeys,valkeys,outkeys = dividefolds(seed=int(outloc.split('.')[1]), num_out=5)
+
+    synth_decrease = 'decsynth' in outloc
+    if 'verysynth' in outloc:
+        synthrate = 0.5
+    else:
+        m = re.search('(\d*\.?\d*)synth',outloc) # Walrus in 3.8
+        if m and m.group(1):
+            synthrate = float(m.group(1))
+            if synthrate > 1:
+                raise ValueError(f'based on {m.group(0)} got synthrate {m.group(1)}>1')
+        elif 'synth' in outloc:
+            synthrate = 0.2
+        else:
+            synthrate = 0
+    if 'extra' in outloc:
+        extrarate = 0.5
+    else:
+        extrarate = 0
+    both_mires = True
+    segment_lines = False
+    one_mire_compatibility = False
+    rand_inner = False
+    one_mire_compatibility ^= rand_inner
+    extraswitch = True
+
+    dataloc = TWO_CIRCLE_DATA_PATH if both_mires else CIRCLE_DATA_PATH
     
-    testtransform = composetransforms([package_goldcoords, constinfo(getdata.ToPil()), randRotate(resizing=True),
-                                       randResizedCrop(256,256,0.25,0.5,circle_fullness=0.95), constinfo(getdata.ToTens())])
+    trainkeys,valkeys,outkeys = dividefolds(seed=int(outloc.split('.')[1]), num_out=5,dataloc=dataloc)
+    
+    testtransform = composetransforms([package_goldcoords(), constinfo(getdata.ToPil()), randRotate(resizing=True),
+                                       randResizedCrop(256,256,0.25,0.5,circle_fullness=0.95), constinfo(getdata.ToTens()), add_classes()])
                                        
-    outtransform = composetransforms([package_goldcoords, constinfo(getdata.ToPil()), constCrop(177,673,945,1441),
-                                      resize(256), constinfo(getdata.ToTens())])
+    outtransform = composetransforms([package_goldcoords(), constinfo(getdata.ToPil()), constCrop(177,673,945,1441),
+                                      resize(256), constinfo(getdata.ToTens()), add_classes()])
     
-    testlocs = ['../../yue/joanne/GAT SL videos/other_techs/raw/F07-OD','../../yue/joanne/GAT SL videos/other_techs/raw/I01-OS',
-                '../../yue/joanne/GAT SL videos/other_techs/raw/I03-OD','../../yue/joanne/GAT SL videos/other_techs/raw/I06-OS']
+    testlocs = ['../../yue/joanne/GAT SL videos/other_techs/raw/I01-OS',
+                '../../yue/joanne/GAT SL videos/other_techs/raw/I03-OD',
+                '../../yue/joanne/GAT SL videos/other_techs/raw/I06-OS']
     testkeys = [os.path.join(testloc,f) for testloc in testlocs for f in os.listdir(testloc)]
     
-    with open(CIRCLE_DATA_PATH) as f:
+    with open(dataloc) as f:
         coordindex = json.load(f)
     
     #testkeys = testkeys + [('fake','fake','fake')]*(len(testkeys)//5)  #Trying adding synthetic data
@@ -398,10 +619,10 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                                                  keys_1=valkeys,
                                                  keys_2=outkeys,
                                                  keys_3=testkeys, 
-                                                 keyadj_0=MaybeFaker(0.5),
-                                                 datlookup=lookup_switch((lambda x: x[0]=='fake'), fakesonly, get_golddat(coordindex)), # Trying adding synthetic data
+                                                 keyadj_0=MaybeFaker(synthrate),
+                                                 datlookup=lookup_switch((lambda x: x[0]=='fake'), fakesonly(extrarate=extrarate,both_mires=both_mires), get_golddat(coordindex)), # Trying adding synthetic data
                                                  #datlookup_01=get_golddat(coordindex),
-                                                 datlookup_3=im_only,
+                                                 datlookup_3=im_only(7+3*both_mires),
                                                  transformer_01=testtransform,
                                                  transformer_23=outtransform)
     
@@ -410,21 +631,21 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
     
     #out_dat.keys = outkeys
     
-    train_loader = DataLoader(train_dat, shuffle=True, batch_size = 4, num_workers = 6, worker_init_fn=setseed)
-    val_loader = DataLoader(val_dat, shuffle=True, batch_size = 2, num_workers = 4, worker_init_fn=setseed)
-    out_loader = DataLoader(out_dat, batch_size=2, num_workers = 2, worker_init_fn=setseed)
+    train_loader = DataLoader(train_dat, shuffle=True, batch_size = 4, num_workers = 4, worker_init_fn=setseed, pin_memory=True)
+    val_loader = DataLoader(val_dat, shuffle=True, batch_size = 2, num_workers = 4, worker_init_fn=setseed, pin_memory=True)
+    out_loader = DataLoader(out_dat, batch_size=2, num_workers = 2, worker_init_fn=setseed, pin_memory=True)
     
     max_epoch = 100
     if outmode:
         start_epoch = max_epoch
         
-    net = models['resnet50'](32,32)
+    net = models['resnet50'](32,32,extraswitch=extraswitch)
     
     net = nn.DataParallel(net)
     optimizer = optim.Adam(net.parameters(),lr=0.001)
     scheduler = ExponentialLR(optimizer, 0.95)
     net = net.cuda()
-    start_epoch='curr'
+    
     if start_epoch and (max_epoch!=start_epoch):
         if start_epoch=='curr' or start_epoch=='prev':
             start_epoch_name = start_epoch
@@ -467,6 +688,13 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                         print('Loading {nettype}_curr (epoch {last_epoch})')
                         model_state = test_model_state
                         start_epoch = last_epoch+1
+        net.load_state_dict(model_state['model'])
+        optimizer.load_state_dict(model_state['optimizer'])
+        if 'scheduler' in model_state:
+            scheduler.load_state_dict(model_state['scheduler'])
+        else:
+            for _ in range(start_epoch):
+                scheduler.step()
     
     save_every = max(int(np.round(max_epoch/50)),1)*5
     
@@ -480,30 +708,43 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
     if(max_epoch==start_epoch):
         outputonly = True
         max_epoch+=1
-    if(start_epoch>0):
+    elif start_epoch>0:
         with open(os.path.join(outloc, 'Epoch_losses.json')) as f:
             epoch_losses = json.load(f)
+        with open(os.path.join(outloc, 'Training_curve.json')) as f:
+            training_curve = json.load(f)
         if not outputonly:
             prevbest = min(epoch_losses['validate'])
             if len(epoch_losses['train'])<start_epoch:
                 warnings.warn(f"Training data only goes to epoch {len(epoch_losses['train'])-1}")
                 epoch_losses['train'] += ['No data']*(start_epoch-len(epoch_losses['train']))
+                training_curve['train'] += [float('nan')]*int(len(training_curve['train'])*(start_epoch/len(epoch_losses['train'])-1))
             if len(epoch_losses['validate'])<start_epoch:
                 warnings.warn(f"Validation data only goes to epoch {len(epoch_losses['validate'])-1}")
                 epoch_losses['validate'] += ['No data']*(start_epoch-len(epoch_losses['validate']))
+                training_curve['validate'] += [float('nan')]*int(len(training_curve['validate'])*(start_epoch/len(epoch_losses['validate'])-1))
             if len(epoch_losses['train'])>start_epoch:
                 warnings.warn("Previous data had data beyond the current starting epoch.  Truncating; please see 'Epoch_losses.json.old' "
-                              "for previous data")
+                              "and 'Training_curve.json.old' for previous data")
                 with open(os.path.join(outloc, 'Epoch_losses.json.old'),'w') as f:
                     json.dump(epoch_losses, f)
+                with open(os.path.join(outloc, 'Training_curve.json.old'),'w') as f:
+                    json.dump(training_curve, f)
+                training_curve['train'] = training_curve['train'][0:start_epoch*len(training_curve['train'])//len(epoch_losses['train'])]
+                training_curve['validate'] = training_curve['train'][0:start_epoch*len(training_curve['validate'])//len(epoch_losses['validate'])]
                 epoch_losses['train'] = epoch_losses['train'][0:start_epoch]
                 epoch_losses['validate'] = epoch_losses['validate'][0:start_epoch]
+                prevbest = min(epoch_losses['validate'])
     else:
         epoch_losses={'train':[],'validate':[]}
         os.makedirs(outloc, exist_ok=True)
         with open(os.path.join(outloc, '_'.join([nettype, 'dat'])), 'wb') as f:
             dill.dump({'train_dat':train_dat, 'val_dat':val_dat, 'out_dat':out_dat}, f)
         prevbest = float('inf')
+        training_curve = {'train':[],'validate':[]}
+        if rand_inner:
+            training_curve['two_mire'] = []
+        
     
     seg_criterion = getdata.Circles_Dice()
     class_weights = None
@@ -511,9 +752,9 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
     line_loss = nn.L1Loss()
     
     if not outputonly:
-        validationsource = infiniloader(val_dat, shuffle=True, batch_size=2, num_workers=2, worker_init_fn=setseed)
+        validationsource = infiniloader(val_dat, shuffle=True, batch_size=2, num_workers=1, worker_init_fn=setseed, pin_memory=True)
         next(validationsource)
-        training_curve = {'train':[],'validate':[]}
+        
         
     if loadloc is not None:
         model_state = load(os.path.join(loadloc, nettype+"_best"))
@@ -534,10 +775,11 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
             modes.append('output')
             modes.append('inference')
             if outputonly:
-                modes = ['inference']
+                modes = ['output','inference']
         for mode in modes:
             if mode == 'train':
-                train_dat.keyadj.p = 0.1+0.8*(99-epoch)/99
+                if synth_decrease:
+                    train_dat.keyadj.p = 0.1+0.8*(99-epoch)/99
                 loader = train_loader
                 noun = 'Training'
                 net.train()
@@ -561,7 +803,7 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                 pressures = {}
                 numfakes = 0
             elif mode == 'inference':
-                loader = DataLoader(inf_dat, batch_size=2, num_workers = 2, worker_init_fn=setseed)
+                loader = DataLoader(inf_dat, batch_size=2, num_workers = 2, worker_init_fn=setseed, pin_memory=True)
                 os.makedirs(os.path.join(outloc,'inferences'), exist_ok=True)
                 noun = 'Inference'
                 if autobest:
@@ -583,8 +825,28 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                 ims = ims.cuda()
                 coords = coords.cuda()
                 classes = classes.cuda()
-                out, out_cls = net(ims)
-                seg_loss = seg_criterion(out[:,:9],coords[:,:6],switch=info['isbot']) # Trying midline segmentation
+                if extraswitch:
+                    switch = info['origseg'].float().cuda()
+                    if mode=='output' or mode=='inference':
+                        switch = torch.ones_like(switch)*0.5
+                    out, out_cls = net(ims,switch)
+                else:
+                    out, out_cls = net(ims)
+                
+                if one_mire_compatibility:
+                    out = torch.cat([out[:,:3],out[:,6:9],out[:,3:6]],1)
+                
+                if rand_inner:
+                    fakeswitch = torch.randint(high=2,size=(ims.size(0),1),device=ims.device)
+                    info['isbot'] = fakeswitch[:,0]
+                    fakeswitch = fakeswitch.cuda()
+                    coords = torch.cat((coords[:,:3],coords[:,3:6]*(1-fakeswitch)+coords[:,6:9]*fakeswitch),1)
+                        
+                
+                if 'isbot' in info:
+                    seg_loss = seg_criterion(out[:,:9],coords[:,:6],switch=info['isbot'])
+                else:
+                    seg_loss = seg_criterion(out[:,:9],coords[:,:9])
                 cls_loss = cls_criterion(out_cls, classes)
                 loss = seg_loss + cls_loss
                 if torch.isnan(loss):
@@ -604,13 +866,12 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                 if mode == 'train':
                     training_curve['train'].append(loss.data.item())
                     
-                    '''
-                    ms = torch.tan(coords[:,6:7]) #Trying midline segmentation
-                    line_loc = torch.cat((ms,coords[:,8:9]-ms*coords[:,7:8]),1)
-                    for n in range(out.size(0)):
-                        if info['key'][2][n]=='fake':
-                            loss = loss + line_loss(out[n,9:],line_loc[n])/(3*out.size(0))
-                    '''
+                    if segment_lines:
+                        ms = torch.tan(coords[:,-3:-2]) #Trying midline segmentation
+                        line_loc = torch.cat((ms,coords[:,-1:]-ms*coords[:,-2:-1]),1)
+                        for n in range(out.size(0)):
+                            if info['key'][2][n]=='fake':
+                                loss = loss + line_loss(out[n,9:],line_loc[n])/(3*out.size(0))
                     
                     loss.backward()
                     optimizer.step()
@@ -618,14 +879,38 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                         net.eval()
                         testinfo, testims, testcoords, testclasses = next(validationsource)
                         testims, testcoords, testclasses = testims.cuda(), testcoords.cuda(), testclasses.cuda()
-                        testout, testout_cls = net(testims)
-                        test_seg_loss = seg_criterion(testout[:,:9],testcoords[:,:6],switch=testinfo['isbot'])
+                        if extraswitch:
+                            testswitch = testinfo['origseg'].float().cuda()
+                            testout, testout_cls = net(testims,testswitch)
+                        else:
+                            testout, testout_cls = net(testims)
+                        
+                        if one_mire_compatibility:
+                            testout = torch.cat([testout[:,:3],testout[:,6:9],testout[:,3:6]],1)
+                        
+                        if rand_inner:
+                            test_seg_loss = seg_criterion(testout[:,:9],testcoords[:,:9])
+                            test_cls_loss = cls_criterion(testout_cls, testclasses)
+                            testloss = test_seg_loss + test_cls_loss
+                            training_curve['two_mire'].append(testloss.data.item())
+                            fakeswitch = torch.randint(high=2,size=(testims.size(0),1),device=ims.device)
+                            testinfo['isbot'] = fakeswitch[:,0]
+                            fakeswitch = fakeswitch.cuda()
+                            testcoords = torch.cat((testcoords[:,:3],testcoords[:,3:6]*(1-fakeswitch)+testcoords[:,6:9]*fakeswitch),1)
+                        
+                        if 'isbot' in testinfo:
+                            test_seg_loss = seg_criterion(testout[:,:9],testcoords[:,:6],switch=testinfo['isbot'])
+                        else:
+                            test_seg_loss = seg_criterion(testout[:,:9],testcoords[:,:9])
                         test_cls_loss = cls_criterion(testout_cls, testclasses)
                         testloss = test_seg_loss + test_cls_loss
                         training_curve['validate'].append(testloss.data.item())
                         net.train()
                 if mode == 'output' or mode=='inference':
-                    imsc = ims.detach().cpu().numpy().transpose(0,2,3,1)
+                    if 'orig' in info:
+                        imsc = info['orig'].numpy().transpose(0,2,3,1)
+                    else:
+                        imsc = ims.detach().cpu().numpy().transpose(0,2,3,1)
                     outc = out.detach().cpu().numpy()
                     out_clsc = out_cls.detach().cpu().numpy()
                     yy, xx = np.mgrid[0:imsc.shape[1],0:imsc.shape[2]]
@@ -647,7 +932,7 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                         infill = ((inra<abs(outc[n,5])).astype(np.uint8)+(inrb<abs(outc[n,8])).astype(np.uint8))*outfill
                         #midline = (abs(yy-outc[n,9]*xx-outc[n,10])<1.5).astype(np.uint8)&outfill #Trying midline segmentation
                         outbord = (abs(outr-abs(outc[n,2]))<1.5).astype(np.uint8)
-                        #inbord = ((abs(inra-abs(outc[n,5]))<1.5).astype(np.uint8)*tophalf+(abs(inrb-abs(outc[n,8]))<1.5).astype(np.uint8)*bothalf)*outfill #Trying midline segmentation
+                        #inbord = ((abs(inra-abs(outc[n,5]))<1.5).astype(np.uint8)*bothalf+(abs(inrb-abs(outc[n,8]))<1.5).astype(np.uint8)*tophalf)*outfill #Trying midline segmentation
                         inbord = ((abs(inra-abs(outc[n,5]))<1.5).astype(np.uint8)+(abs(inrb-abs(outc[n,8]))<1.5).astype(np.uint8))*outfill
                         #ax2.imshow(outfill+infill+midline, cmap='Set1', norm = NoNorm()) #Trying midline segmentation
                         ax2.imshow(outfill+infill, cmap='Set1', norm = NoNorm())
@@ -698,35 +983,41 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
                     prevbest = np.mean(cur_losses)
                 csvout(outloc, training_curve, epoch_losses, math.ceil(len(train_dat)/train_loader.batch_size))
                 smoothed_tc(outloc, training_curve)
-    if mode == 'output':
-        with open(os.path.join(outloc,'results'), 'w') as f:
-            f.write('\n'.join([str(x) for x in results]))
-        vid_dict = {}
-        for key in pressures:
-            vid = key.split('_')[0]
-            if vid not in vid_dict:
-                vid_dict[vid] = []
-            vid_dict[vid].append(key)
-        
-        for vid, frames in vid_dict.items():
-            fnums = []
-            iops = [[],[]]
-            frames.sort()
-            for f in frames:
-                fnums.append(int(f.split('_')[1].split('.')[0]))
-                for pres, preslist in zip(pressures[f], iops):
-                    preslist.append(pres)
-            fig, ax = plt.subplots()
-            ax.plot(fnums,iops[0],'bo',label='Inference')
-            ax.plot(fnums,iops[1],'go',label='Ground truth')
-            ax.legend()
-            bot, top = ax.get_ylim()
-            ax.set_ylim(top=min(top,50))
-            fig.savefig(os.path.join(outloc,vid+' pressures.png'))
-            plt.close(fig)
-            with open(os.path.join(outloc,vid+' pressures.csv'),'w') as f:
-                for frame, pres in zip(frames,iops[0]):
-                    f.write(f'{frame},{pres}\n')
+            if mode == 'output':
+                with open(os.path.join(outloc,'results'), 'w') as f:
+                    f.write('\n'.join([str(x) for x in results]))
+                vid_dict = {}
+                for key in pressures:
+                    vid = key.split('_')[0]
+                    if vid not in vid_dict:
+                        vid_dict[vid] = []
+                    vid_dict[vid].append(key)
+                
+                for vid, frames in vid_dict.items():
+                    fnums = []
+                    iops = [[],[]]
+                    frames.sort()
+                    for f in frames:
+                        fnums.append(int(f.split('_')[1].split('.')[0]))
+                        for pres, preslist in zip(pressures[f], iops):
+                            preslist.append(pres)
+                    fig, ax = plt.subplots()
+                    ax.plot(fnums,iops[0],'bo',label='Inference')
+                    ax.plot(fnums,iops[1],'go',label='Ground truth')
+                    try:
+                        measured_pressure = int(vid.split('-')[0])
+                    except ValueError:
+                        warnings.warn(f"Couldn't get measure pressure from {vid}")
+                    else:
+                        ax.plot([min(fnums),max(fnums)],[measured_pressure,measured_pressure],'--',label='Measured pressure')
+                    ax.legend()
+                    bot, top = ax.get_ylim()
+                    ax.set_ylim(top=min(top,50))
+                    fig.savefig(os.path.join(outloc,vid+' pressures.png'))
+                    plt.close(fig)
+                    with open(os.path.join(outloc,vid+' pressures.csv'),'w') as f:
+                        for frame, pres in zip(frames,iops[0]):
+                            f.write(f'{frame},{pres}\n')
             
             
     if not outputonly:
@@ -734,14 +1025,28 @@ def testcycle(outloc, setloc = None, nettype='UNet', position=None, outmode=Fals
             validationsource.send(1)
         except StopIteration:
             pass
-  
+    
 if __name__ == "__main__":
     #logging.basicConfig(level=logging.INFO)
     
-    os.environ["CUDA_VISIBLE_DEVICES"] = '2'
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
     print(f'Using CUDA {os.environ["CUDA_VISIBLE_DEVICES"]}:')
+    '''
+    vidlist = ['../../yue/joanne/GAT SL videos/videos/I01-OS.MOV',
+               '../../yue/joanne/GAT SL videos/videos/I03-OS.MOV',
+               '../../yue/joanne/GAT SL videos/videos/I06-OS.MOV']
+    types = [amt+'synthdata-col'+randtype+extra+'.0' for amt in ['very','dec'] for randtype in ['switch','conv'] for extra in ['extra','']]
+    vidlist = vidlist + [os.path.join('videos',f) for f in os.listdir('videos')]
     
-    testcats = ['tests/decsynthdata-colswitch.0']
+    for type in types:
+        pss, rss = process_videos(type,vidlist)
+        for k, v in pss.items():
+            _, vidname = os.path.split(k)
+            with open(os.path.join('tests',type,vidname.split('.')[0]+'.json'),'w') as f:
+                json.dump(v,f)
+    quit()
+    '''
+    testcats = ['tests/verysynthdata-colswitch-bothmires-redata-graderinfo.0']
     
     for testcat in testcats:
-        testcycle(testcat,outmode=False)
+        testcycle(testcat,outmode=False,start_epoch='curr')
