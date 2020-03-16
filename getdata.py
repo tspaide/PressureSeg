@@ -48,10 +48,10 @@ def calc_iop_tonomat(dia, tonometer=5):
     #     iop_dict[real_dia] = np.round(25 - (real_dia - 4.3) * 10, 0)
     # for dia in range(37, 44, 1):
     #     real_dia = dia/10.
-    #     iop_dict[real_dia] = np.round(37 -20*(real_dia - 3.7), 0)
+    #     iop_dict[real_dia] = np.round(37 - 20*(real_dia - 3.7), 0)
     # for dia in range(35, 37, 1):
     #     real_dia = dia/10.
-    #     iop_dict[real_dia] = np.round(43 -30*(real_dia - 3.5), 0)
+    #     iop_dict[real_dia] = np.round(43 - 30*(real_dia - 3.5), 0)
 
     return iop
 
@@ -78,7 +78,7 @@ def calc_iop_from_circles(lens_circle, inner_circle):
     iop = calc_iop_wrapper(real_inner_dia)
     return iop
 
-def overlap(circa, circb, missloss = False):
+def overlap(circa, circb, missloss = False, epsilon = 0.001):
     """Return the area of intersection of two circles and whether one contains another.
     Circles should be (3,) tensors of the form [x,y,r]
     If missloss, will return negative numbers if circles don't intersect at all
@@ -101,8 +101,20 @@ def overlap(circa, circb, missloss = False):
     
     r2, R2 = r**2, R**2
     alpha = torch.acos((d2 + r2 - R2) / (2*d*r))
+    alpha_area = r2*(alpha-0.5*torch.sin(2*alpha)) # isnan check for this and beta_area?
     beta = torch.acos((d2 + R2 - r2) / (2*d*R))
-    return ( r2 * alpha + R2 * beta - 0.5 * (r2 * torch.sin(2*alpha) + R2 * torch.sin(2*beta)) ), False
+    beta_area = R2*(beta-0.5*torch.sin(2*beta))
+    ans = alpha_area+beta_area
+    if torch.isnan(ans):
+        torch.set_printoptions(precision=20)
+        print('nan overlap')
+        print(r,r2)
+        print(R,R2)
+        print(d,d2)
+        print((d2 + r2 - R2) / (2*d*r), (d2 + R2 - r2) / (2*d*R))
+        print(alpha,beta)
+        quit()
+    return ans, False
     
 def dice_circle_loss(circa, circb, epsilon=0.001, size_average=True, reduce = True, negate = True,
                      missloss = True, addloss = None, cropbox = None):
@@ -163,6 +175,15 @@ def dice_circle_loss(circa, circb, epsilon=0.001, size_average=True, reduce = Tr
             divisor = 1
         return torch.sum(dices)/divisor
     return dices
+    
+def circle_select(out, switch):
+    outin = torch.empty_like(outlens)
+    for n in range(out.size(0)):
+        if switch[n]:
+            outin[n] = out[n,3:6]
+        else:
+            outin[n] = out[n,6:9]
+    return torch.cat([out[:,:3],outin],1)
     
 class Circles_Dice():
     '''
@@ -387,7 +408,7 @@ def getannotations(circle_file):
     return annotations
 
 class ToPil():
-    def __call__(self,  image, lens_data = None, inner_data = None, *a):
+    def __call__(self, image, lens_data = None, inner_data = None, *a):
         if lens_data is None:
             image, lens_data, inner_data, *a = image
         return (F.to_pil_image(image), lens_data, inner_data, *a)
@@ -444,8 +465,9 @@ class RandomResizedCropP():
             else:
                 maxscale, minscale = self.maxscale, self.minscale
             scale = np.random.random_sample() * (maxscale-minscale)+minscale
+            
         cropwidth = self.finwidth/scale
-        cropheight  = self.finheight/scale
+        cropheight = self.finheight/scale
         if (self.tame == 'yes' or self.tame == 'sides'):
             minx = max(0, lx+self.fullness*lr-cropwidth)
             maxx = min(width-cropwidth, lx-self.fullness*lr) + 1
@@ -465,7 +487,7 @@ class RandomResizedCropP():
             print(inner_data)
             print(width, height)
             print(scale, cropwidth, cropheight)
-            print(self.circle_fullness)
+            print(self.fullness)
         x = np.random.randint(minx, maxx)
         y = np.random.randint(miny, maxy)
         lx, ly, lr = scale*(lx-x),scale*(ly-y),scale*lr
@@ -510,7 +532,7 @@ class CropP():
         extrarets = []
         if i2:
             (ix2, iy2, ir2) = i2[0]
-            extrarets.append((ix2-self.minx,iy2-self.miny,ir))
+            extrarets.append((ix2-self.minx,iy2-self.miny,ir2))
         if self.transform_line:
             lang,ox,oy = line_dat # Trying midline segmentation
             extrarets.append((lang,ox-self.minx,oy-self.miny))
@@ -596,7 +618,7 @@ class PadP():
         extrarets = []
         if i2:
             (ix2, iy2, ir2) = i2[0]
-            extrarets.append((ix2+self.x,iy2+self.y,ir))
+            extrarets.append((ix2+self.x,iy2+self.y,ir2))
         if self.transform_line:
             lang,ox,oy = line_dat # Trying midline segmentation
             extrarets.append((lang,ox+self.x,oy+self.y))
@@ -653,7 +675,7 @@ def rotateP(image, lens_data = None, inner_data = None, *i2, angle=0, resizing=F
     extrarets = []
     if i2:
         (ix2, iy2, ir2) = i2[0]
-        extrarets.append((ix2,iy2,ir))
+        extrarets.append((ix2,iy2,ir2))
     if transform_line:
         lang,ox,oy = line_dat # Trying midline segmentation
         extrarets.append((lang-arad,ox,oy))

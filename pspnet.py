@@ -21,6 +21,21 @@ class SwitchConv(nn.Module):
         x = self.prelu(x)
         return x
 
+class AugConv(nn.Module):
+    def __init__(self, inchannels, outchannels, kernel_size=3, padding=1, stride=1, **kwargs):
+        super().__init__()
+        self.conv = nn.Conv2d(inchannels, outchannels, kernel_size=kernel_size, padding=padding, stride=stride, **kwargs)
+        self.yconv = nn.Conv2d(1, outchannels, kernel_size=1)
+        self.xconv = nn.Conv2d(1, outchannels, kernel_size=1)
+        self.bn = nn.BatchNorm2d(outchannels)
+        self.prelu = nn.PReLU()
+        
+    def forward(self, x, yaug, xaug):
+        x = self.conv(x)+self.yconv(yaug)+self.xconv(xaug)
+        x = self.bn(x)
+        x = self.prelu(x)
+        return x
+        
 class PSPModule(nn.Module):
     def __init__(self, features, out_features=1024, sizes=(1, 2, 3, 6)):
         super().__init__()
@@ -100,7 +115,7 @@ class PSPNet(nn.Module):
         
 class PSPCircs(nn.Module):
     def __init__(self, n_classes=3, out_nums=6, sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet34',
-                 pretrained=True, w=64, h=54, extraend=False, extraswitch=False):
+                 pretrained=True, w=64, h=54, extraend=False, extraswitch=False, final_aug=False):
         super().__init__()
         self.feats = getattr(extractors, backend)(pretrained)
         self.psp = PSPModule(psp_size, 1024, sizes)
@@ -108,11 +123,22 @@ class PSPCircs(nn.Module):
             self.conv1 = SwitchConv(1024, 256)
         else:
             self.conv1 = self._convlayer(1024, 256)
-        self.conv2 = self._convlayer(256, 256)
+        # Trying coord augmentation
+        # Changes start here
+        self.final_aug = final_aug
+        if final_aug:
+            self.conv2 = AugConv(256,256)
+        else:
+            self.conv2 = self._convlayer(256, 256)
+        #self.conv2 = self._convlayer(256, 256)
+        
+        # Changes end here
+        
         self.conv3 = self._convlayer(256, 256)
+        
         if extraend:
             self.fin = nn.Sequential(
-                self._downlayer(256,256),
+                self._downlayer(256,256), # ???
                 self._downlayer(256,256),
                 nn.Conv2d(256, 256, kernel_size=(h//4,w//4)),
                 nn.Conv2d(256, out_nums, kernel_size=1)
@@ -149,7 +175,7 @@ class PSPCircs(nn.Module):
                                        nn.BatchNorm2d(outchannels),
                                        nn.PReLU())
         
-    def forward(self, x, switcher=None):
+    def forward(self, x, switcher=None, yaug=None, xaug=None):
         #x = self.instnorm(x)
         f, class_f = self.feats(x)
         p = self.psp(f)
@@ -162,7 +188,16 @@ class PSPCircs(nn.Module):
             if switcher is not None:
                 raise TypeError('Got a switcher with no switching')
             p = self.conv1(p)
-        p = self.conv2(p)
+            
+        # Trying coordinate augmentation
+        # Changes start here
+        if self.final_aug:
+            p = self.conv2(p,yaug,xaug)
+        else:
+            p = self.conv2(p)
+        #p = self.conv2(p)
+        # Changes end here
+        
         p3 = self.conv3(p)
         p = self.fin(p3)
         p = p.view(-1,p.size(1))

@@ -199,6 +199,7 @@ def goldmann_fake(innerprob=3885/5099, extra=False, color_mode='rand', bothmires
             ixl,iyl,irl = inner_x-shift*np.cos(line_angle),inner_y-shift*np.sin(line_angle),inner_r
             ixr,iyr,irr = inner_x+shift*np.cos(line_angle),inner_y+shift*np.sin(line_angle),inner_r
         inner_dat = ixl,iyl,irl,ixr,iyr,irr
+        outswitch = 0.5
     else:
         if not drawinnercirc:
             inner_dat = 0,0,0
@@ -206,15 +207,16 @@ def goldmann_fake(innerprob=3885/5099, extra=False, color_mode='rand', bothmires
             inner_dat = inner_x+shift*np.cos(line_angle),inner_y+shift*np.sin(line_angle),inner_r
         else:
             inner_dat = inner_x-shift*np.cos(line_angle),inner_y-shift*np.sin(line_angle),inner_r
+        outswitch = switch
     if midline:
         line_dat = line_angle,outer_x,outer_y
     else:
         line_dat = ()
-    return (im*(1-shadow_mask)).astype(np.uint8), (top_x,top_y,top_r,*inner_dat,0.5,*line_dat)
+    return (im*(1-shadow_mask)).astype(np.uint8), (top_x,top_y,top_r,*inner_dat,outswitch,*line_dat)
     
 if __name__=='__main__':
-    for n in range(5):
-        im, coords = goldmann_fake(extra=(n+1)%2, color_mode='randcomb')
+    for n in range(10):
+        im, coords = goldmann_fake(extra=0, color_mode='randcomb')
         yy,xx,_ = np.mgrid[0:im.shape[0],0:im.shape[1],0:1]
         outx,outy,outr,inxl,inyl,inrl,inxr,inyr,inrr,s = coords
 
@@ -228,7 +230,7 @@ if __name__=='__main__':
             incircr = (abs(((xx-inxr)**2+(yy-inyr)**2)**0.5-inrr)<2).astype(np.uint8)
         else:
             incircr = np.zeros_like(outcirc)
-        im = im.astype(np.uint8)*(1-(outcirc|incircr|incircl))|(outcirc*np.array([255,0,0],dtype=np.uint8))|(incircl*np.array([0,255,255],dtype=np.uint8))|(incircr*np.array([255,255,0],dtype=np.uint8))
+        im = im.astype(np.uint8)*(1-(outcirc|incircr|incircl))|(outcirc*np.array([255,0,0],dtype=np.uint8))|(incircl*np.array([255,0,255],dtype=np.uint8))|(incircr*np.array([255,127,0],dtype=np.uint8))
         print(s)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
